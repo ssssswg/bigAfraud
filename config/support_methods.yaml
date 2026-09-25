@@ -87,6 +87,16 @@ strategies:
     support_method: ma20
     description: 金叉不绿策略，使用20日均线作为支撑位
 
+  # 龙头策略
+  LeaderStrategy:
+    support_method: key_open
+    description: 龙头策略，使用关键日开盘价作为支撑位
+
+  # 主升低吸策略
+  MainUptrendDipBuyStrategy:
+    support_method: key_close_5
+    description: 一拉二调后贴紧突破R，使用关键日收盘价下跌5%作为支撑位
+
 # 默认支撑位计算方法（当策略未配置时使用）
 default_support_method: ma20
 

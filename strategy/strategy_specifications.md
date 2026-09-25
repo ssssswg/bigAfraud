@@ -16,6 +16,14 @@
 | 10 | 阻力位突破策略 | ResistanceBreakoutStrategy | [spec/阻力位突破策略说明书.md](spec/阻力位突破策略说明书.md) |
 | 11 | 强势洗盘弱转强策略 | StrongWashWeakToStrongStrategy | [spec/强势洗盘弱转强策略说明书.md](spec/强势洗盘弱转强策略说明书.md) |
 | 12 | 趋势加速拐点策略 | TrendAccelerationInflectionStrategy | [spec/趋势加速拐点策略说明书.md](spec/趋势加速拐点策略说明书.md) |
+| 13 | 趋势起点策略 | TrendStartStrategy | [spec/趋势起点策略说明书.md](spec/趋势起点策略说明书.md) |
+| 14 | 金三角策略 | GoldenTriangleStrategy | [spec/金三角策略说明书.md](spec/金三角策略说明书.md) |
+| 15 | 金叉不绿策略 | GoldenCrossNotGreenStrategy | [spec/金叉不绿策略说明书.md](spec/金叉不绿策略说明书.md) |
+| 16 | 龙头策略 | LeaderStrategy | [spec/龙头策略说明书.md](spec/龙头策略说明书.md) |
+| 17 | 主升低吸策略 | MainUptrendDipBuyStrategy | [spec/主升低吸策略说明书.md](spec/主升低吸策略说明书.md) |
+| 18 | 低位九转策略 | LowTD9Strategy | [spec/低位九转策略说明书.md](spec/低位九转策略说明书.md) |
+| 19 | 超跌反弹策略 | OversoldReboundStrategy | [spec/超跌反弹策略说明书.md](spec/超跌反弹策略说明书.md) |
+| 20 | 趋势共振反转策略 | TrendResonanceReversalStrategy | [spec/趋势共振反转策略说明书.md](spec/趋势共振反转策略说明书.md) |
 
 ## 策略分类汇总表
 
@@ -33,6 +41,14 @@
 | 阻力突破 | 阻力位突破策略 | 放量长阳突破关键阻力 | 突破买入 |
 | 洗盘策略 | 强势洗盘弱转强策略 | 放量上涨+洗盘+反包 | 强势股回调 |
 | 趋势加速 | 趋势加速拐点策略 | 上升趋势+放量长阳 | 趋势加速确认 |
+| 趋势启动 | 趋势起点策略 | MACD 0轴上金叉 + 布林上穿中轨 | 趋势启动 |
+| 趋势拐点 | 金三角策略 | 5/10/20日均线金三角形态 | 趋势拐点 |
+| 指标共振 | 金叉不绿策略 | MACD水上金叉 + 绿柱数≤3 | 精准金叉 |
+| 龙头追涨 | 龙头策略 | 当日涨停 + 早封板 + 高换手 + 小流通盘 | 强势龙头 |
+| 趋势回调 | 主升低吸策略 | 一拉→二调→放量长阳突破回调高点R | 主升途中低吸 |
+| 底部反转 | 低位九转策略 | TD Sequential 买入Countdown 低位9转 | 底部反转 |
+| 超跌反弹 | 超跌反弹策略 | 深度超跌 + MACD底背离 + 底部特征共振 | 超跌反弹 |
+| 底部反转 | 趋势共振反转策略 | RSI/均线/MACD多指标共振底部反转 | 底部反转 |
 
 ## 通用输出格式说明
 

@@ -78,6 +78,26 @@ strategies:
     profit_loss_ratio: 3
     description: 金叉不绿策略
 
+  LeaderStrategy:
+    win_rate: 0.3
+    profit_loss_ratio: 3.5
+    description: 龙头策略
+
+  MainUptrendDipBuyStrategy:
+    win_rate: 0.3
+    profit_loss_ratio: 3.5
+    description: 主升低吸策略
+
+  LowTD9Strategy:
+    win_rate: 0.28
+    profit_loss_ratio: 3.0
+    description: 低位九转策略
+
+  OversoldReboundStrategy:
+    win_rate: 0.28
+    profit_loss_ratio: 3.0
+    description: 超跌反弹策略
+
   _default_:
     win_rate: 0.28
     profit_loss_ratio: 3.2
