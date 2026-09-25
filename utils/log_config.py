@@ -13,6 +13,17 @@ from typing import Optional
 from datetime import datetime, timedelta
 
 
+class _WerkzeugAccessFilter(logging.Filter):
+    """过滤 werkzeug 的 HTTP 访问日志（每个请求一行），保留启动提示等其他 INFO 日志。"""
+
+    def filter(self, record):
+        msg = record.getMessage()
+        # 访问日志特征：包含 " - - " 且含请求行引号，例如
+        # 127.0.0.1 - - [2026-09-26 ..] "GET /api/.. HTTP/1.1" 200 -
+        # 启动提示（Running on http://...）、调试信息等不含该特征，予以保留
+        return not (' - - ' in msg and '"' in msg)
+
+
 class LogConfig:
     """日志配置管理类"""
 
@@ -130,6 +141,11 @@ class LogConfig:
             root_logger.handlers.clear()
 
         root_logger.addHandler(queue_handler)
+
+        # 过滤 werkzeug 的 HTTP 访问日志，保留启动提示（Running on http://...）等其他 INFO
+        wz_logger = logging.getLogger('werkzeug')
+        if not any(isinstance(f, _WerkzeugAccessFilter) for f in wz_logger.filters):
+            wz_logger.addFilter(_WerkzeugAccessFilter())
 
         logger = logging.getLogger(__name__)
         logger.info("=" * 60)
