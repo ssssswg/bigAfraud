@@ -1,0 +1,4 @@
+{
+  "token": "",
+  "_comment": "填入你的 Tushare Pro token（需5000积分开通 limit_list_d 涨停接口）。空token时Tushare数据源自动降级为不可用，不影响其余数据源。获取地址 https://tushare.pro"
+}
