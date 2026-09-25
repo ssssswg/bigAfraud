@@ -8,7 +8,8 @@ from utils.data_sources import (
     DataSource,
     TushareProDataSource,
     TencentDataSource,
-    EastMoneyDataSource
+    EastMoneyDataSource,
+    BaostockDataSource
 )
 
 class DataFetcher:
@@ -29,10 +30,10 @@ class DataFetcher:
             if config_path.exists():
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
-                enabled_sources = config.get("enabled", ["tushare_pro", "tencent", "eastmoney"])
+                enabled_sources = config.get("enabled", ["tushare_pro", "tencent", "eastmoney", "baostock"])
             else:
                 # 默认启用所有数据源
-                enabled_sources = ["tushare_pro", "tencent", "eastmoney"]
+                enabled_sources = ["tushare_pro", "tencent", "eastmoney", "baostock"]
             
             # 初始化数据源
             if "tushare_pro" in enabled_sources:
@@ -58,6 +59,14 @@ class DataFetcher:
                     self.logger.info("东方财富数据源加载成功")
                 except Exception as e:
                     self.logger.error(f"东方财富数据源初始化失败: {e}")
+            
+            if "baostock" in enabled_sources:
+                try:
+                    baostock_source = BaostockDataSource()
+                    self.data_sources.append(baostock_source)
+                    self.logger.info("Baostock 数据源加载成功")
+                except Exception as e:
+                    self.logger.error(f"Baostock 数据源初始化失败: {e}")
             
             # 按优先级排序
             self.data_sources.sort(key=lambda x: x.priority)
