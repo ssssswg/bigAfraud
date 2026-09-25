@@ -516,105 +516,121 @@ class FundFlowUpdater:
     def _save_industry_fund_flow_records(self, df_fund_flow: pd.DataFrame) -> int:
         """
         保存行业资金流向记录到数据库
-        
+
         参数：
             df_fund_flow: 资金流向数据DataFrame
-        
+
         返回：
             保存的记录数
         """
         saved = 0
-        
+
         try:
-            # INSERT SQL 语句
+            # INSERT SQL 语句（列与 industry_fund_flow 表结构对齐）
             insert_sql = """
             INSERT OR REPLACE INTO industry_fund_flow 
-            (industry_name, trade_date, buy_vol, buy_amount, sell_vol, sell_amount, net_vol, net_amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            (industry_code, industry_name, flow_date, period, main_net_flow, super_large_net_flow, 
+             large_net_flow, medium_net_flow, small_net_flow, net_flow_rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
-            
+
             # 直接保存数据，不使用事务（由外层调用者管理事务）
             for _, row in df_fund_flow.iterrows():
                 try:
-                    # 将日期转换为字符串格式
-                    date_str = str(row['trade_date']).split(' ')[0]
-                    
+                    # 将日期转换为字符串格式（YYYYMMDD 或 YYYY-MM-DD）
+                    date_str = str(row.get('trade_date', '')).split(' ')[0]
+                    if len(date_str) == 8:
+                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    if not date_str:
+                        continue
+
+                    # 行业代码（tushare moneyflow_ind_ths 字段为 ts_code，必填）
+                    industry_code = row.get('ts_code', row.get('industry_code', ''))
+                    industry_name = row.get('industry', row.get('industry_name', ''))
+
+                    # 资金流向（单位：亿元）转换为万元（1亿 = 10000万）
+                    net_amount = float(row.get('net_amount', 0)) or 0
+                    net_buy = float(row.get('net_buy_amount', 0)) or 0
+                    net_sell = float(row.get('net_sell_amount', 0)) or 0
+                    main_net_flow = net_amount * 10000
+                    net_flow_rate = (net_amount / (net_buy + net_sell) * 100) if (net_buy + net_sell) > 0 else 0
+
                     # 执行 INSERT 操作
                     self.db_manager.execute_with_retry(insert_sql, (
-                        row['industry_name'],
-                        date_str,
-                        int(row.get('buy_vol', 0)),
-                        float(row.get('buy_amount', 0)),
-                        int(row.get('sell_vol', 0)),
-                        float(row.get('sell_amount', 0)),
-                        int(row.get('net_vol', 0)),
-                        float(row.get('net_amount', 0))
+                        industry_code, industry_name, date_str, 'daily', main_net_flow, 0, 0, 0, 0, net_flow_rate
                     ))
-                    
+
                     saved += 1
-                
+
                 except Exception as e:
                     logger.debug(f"保存行业资金流向数据失败：{str(e)}")
-            
+
             logger.debug(f"保存行业资金流向数据成功：{saved} 条记录")
-            
+
             return saved
-        
+
         except Exception as e:
             logger.error(f"保存行业资金流向数据失败：{str(e)}")
             return 0
-    
     def _save_sector_fund_flow_records(self, df_fund_flow: pd.DataFrame) -> int:
         """
         保存板块资金流向记录到数据库
-        
+
         参数：
             df_fund_flow: 资金流向数据DataFrame
-        
+
         返回：
             保存的记录数
         """
         saved = 0
-        
+
         try:
-            # INSERT SQL 语句
+            # INSERT SQL 语句（列与 sector_fund_flow 表结构对齐）
             insert_sql = """
-            INSERT INTO sector_fund_flow 
-            (sector_name, trade_date, buy_vol, buy_amount, sell_vol, sell_amount, net_vol, net_amount)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO sector_fund_flow 
+            (sector_code, sector_name, flow_date, period, main_net_flow, super_large_net_flow, 
+             large_net_flow, medium_net_flow, small_net_flow, net_flow_rate)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
-            
+
             # 直接保存数据，不使用事务（由外层调用者管理事务）
             for _, row in df_fund_flow.iterrows():
                 try:
-                    # 将日期转换为字符串格式
-                    date_str = str(row['trade_date']).split(' ')[0]
-                    
-                    # 执行INSERT操作
+                    # 将日期转换为字符串格式（YYYYMMDD 或 YYYY-MM-DD）
+                    date_str = str(row.get('trade_date', '')).split(' ')[0]
+                    if len(date_str) == 8:
+                        date_str = f"{date_str[:4]}-{date_str[4:6]}-{date_str[6:8]}"
+                    if not date_str:
+                        continue
+
+                    # 板块代码（tushare moneyflow_cnt_ths 字段为 ts_code，必填）
+                    sector_code = row.get('ts_code', row.get('sector_code', ''))
+                    sector_name = row.get('name', row.get('sector_name', ''))
+
+                    # 资金流向（单位：亿元）转换为万元（1亿 = 10000万）
+                    net_amount = float(row.get('net_amount', 0)) or 0
+                    net_buy = float(row.get('net_buy_amount', 0)) or 0
+                    net_sell = float(row.get('net_sell_amount', 0)) or 0
+                    main_net_flow = net_amount * 10000
+                    net_flow_rate = (net_amount / (net_buy + net_sell) * 100) if (net_buy + net_sell) > 0 else 0
+
+                    # 执行 INSERT 操作
                     self.db_manager.execute_with_retry(insert_sql, (
-                        row['sector_name'],
-                        date_str,
-                        int(row.get('buy_vol', 0)),
-                        float(row.get('buy_amount', 0)),
-                        int(row.get('sell_vol', 0)),
-                        float(row.get('sell_amount', 0)),
-                        int(row.get('net_vol', 0)),
-                        float(row.get('net_amount', 0))
+                        sector_code, sector_name, date_str, 'daily', main_net_flow, 0, 0, 0, 0, net_flow_rate
                     ))
-                    
+
                     saved += 1
-                
+
                 except Exception as e:
                     logger.debug(f"保存板块资金流向数据失败: {str(e)}")
-            
+
             logger.debug(f"保存板块资金流向数据成功: {saved} 条记录")
-            
+
             return saved
-        
+
         except Exception as e:
             logger.error(f"保存板块资金流向数据失败: {str(e)}")
             return 0
-    
     def get_progress(self) -> Dict:
         """获取更新进度"""
         return self.progress.copy()

@@ -634,8 +634,8 @@ class BacktestDAO:
                 INSERT INTO backtest_trade (
                     result_id, stock_code, stock_name, buy_date, 
                     buy_price, sell_date, sell_price, buy_amount, 
-                    sell_amount, profit, profit_rate, trade_type
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    profit_loss, return_rate, trade_type
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """
             params = (
                 trade.get('result_id', 0),
@@ -646,7 +646,6 @@ class BacktestDAO:
                 trade.get('sell_date', ''),
                 trade.get('sell_price', 0),
                 trade.get('buy_amount', 0),
-                trade.get('sell_amount', 0),
                 trade.get('profit', 0),
                 trade.get('profit_rate', 0),
                 trade.get('trade_type', 'normal')
