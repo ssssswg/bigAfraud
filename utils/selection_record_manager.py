@@ -407,48 +407,30 @@ class SelectionRecordManager:
     
     def _get_stock_industry(self, stock_code: str) -> str:
         """
-        获取股票行业信息
-        优先从stock_basic表获取，如果没有则尝试从industry_fetcher获取
-        
+        获取股票行业信息：只从 stock_basic 表读取，不再触发数据源网络拉取
+
+        说明：行业为空的股票（多为数据源镜像缺失/退市/特殊状态，如 002505、600321）
+        从 tushare/eastmoney 等源重试（3 源 × 3 次全表 stock_basic）必然失败，
+        会在保存选股结果时刷大量 ERROR/ProxyError 日志并严重拖慢保存。
+        行业补全统一由数据初始化流程负责，此处不承担在线拉取。
+
         参数：
             stock_code: 股票代码
-        
+
         返回：
             行业名称，如果获取失败返回空字符串
         """
         try:
-            # 首先尝试从stock_basic表获取
-            industry = None
-            cursor = self.db_manager.execute_with_retry("SELECT industry FROM stock_basic WHERE code = ?", (stock_code,))
+            cursor = self.db_manager.execute_with_retry(
+                "SELECT industry FROM stock_basic WHERE code = ?", (stock_code,))
             row = cursor.fetchone()
             if row and row[0]:
-                industry = row[0]
-            
-            if industry:
-                return industry
-            
-            # 如果stock_basic表中没有，尝试使用industry_fetcher获取
-            try:
-                from utils.industry_fetcher import IndustryFetcher
-                from utils.cache_manager import CacheManager
-                
-                cache_manager = CacheManager()
-                fetcher = IndustryFetcher(self.db_manager, cache_manager)
-                
-                # 使用fetch_with_retry获取行业信息
-                industry_data = fetcher.fetch_with_retry(stock_code=stock_code)
-                if industry_data and 'industry_name' in industry_data:
-                    industry_name = industry_data['industry_name']
-                    logger.debug(f"从industry_fetcher获取到股票 {stock_code} 的行业: {industry_name}")
-                    return industry_name
-            except Exception as e:
-                logger.debug(f"从industry_fetcher获取行业信息失败: {str(e)}")
-            
+                return row[0]
             return ''
         except Exception as e:
             logger.warning(f"获取股票 {stock_code} 行业信息失败: {str(e)}")
             return ''
-    
+
     def _get_stock_sector(self, stock_code: str) -> str:
         """
         获取股票板块信息

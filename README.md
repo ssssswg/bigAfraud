@@ -187,7 +187,7 @@ python main.py web
 
 | 数据源 | 类型 | 说明 |
 |--------|------|------|
-| tushare_pro | 需 token | 需在 `config/tushare_config.json` 配置 token；龙头策略的涨停接口 `limit_list_d` 需 5000 积分 |
+| tushare_pro | 需 token https://tushare.pro/ | 需在 `config/tushare_config.json` 配置 token；龙头策略的涨停接口 `limit_list_d` 需 5000 积分 |
 | tencent | 免费 | 腾讯财经行情 |
 | eastmoney | 免费 | 东方财富行情 |
 | baostock | 免费 | 行情/K线/股票列表/行业数据（免费无 token）https://www.baostock.com 证券宝www.baostock.com是一个免费、开源的证券数据平台（无需注册）。 |

@@ -213,7 +213,7 @@ class QuantSystem:
         print(f"共 {len(stock_codes)} 只股票")
 
         # 过滤：只保留主板
-        stock_codes = [c for c in stock_codes if c[:3] in ('600','601','603','605','000','001','002','003')]
+        stock_codes = [c for c in stock_codes if c[:3] in ('600','601','603','605','000','001','002','003','300','301')]  # 沪市主板+深市主板+创业板（排除科创板688、北交所）
         process_codes = stock_codes[:max_stocks] if max_stocks else stock_codes
         print(f"过滤主板后: {len(process_codes)} 只股票")
 
