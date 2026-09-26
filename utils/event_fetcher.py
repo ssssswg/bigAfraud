@@ -4,6 +4,7 @@
 参考 stock-master: stock_lhb_em.py
 """
 
+from utils.tushare_client import get_pro
 import json
 import logging
 import time
@@ -54,9 +55,9 @@ class TushareEventSource(DataSource):
             
             # 创建pro实例
             if token:
-                self._pro = ts.pro_api(token)
+                self._pro = get_pro(token)
             else:
-                self._pro = ts.pro_api()
+                self._pro = get_pro()
             
             return self._pro
         except Exception as e:

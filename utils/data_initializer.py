@@ -69,7 +69,7 @@ class DataInitializer:
             
             # 步骤2：获取股票市值（批量）
             logger.info("从 Tushare 获取股票市值信息...")
-            market_caps = self.stock_data_fetcher.get_stock_market_cap()
+            market_caps = self.stock_data_fetcher.get_stock_market_cap(stock_codes=stock_codes)
             
             if market_caps:
                 logger.info(f"成功获取 {len(market_caps)} 只股票的市值信息")
@@ -387,14 +387,39 @@ class DataInitializer:
     
     def _init_industry_data(self, stock_codes: list) -> None:
         """
-        初始化行业数据
+        初始化行业数据（写入 stock_basic.industry）
         
         参数：
             stock_codes: 股票代码列表
         """
-        logger.info("初始化行业数据...")
-        # TODO: 实现行业数据初始化逻辑
-        logger.info("行业数据初始化完成")
+        self._write_industry_to_stock_basic(stock_codes)
+
+    def _write_industry_to_stock_basic(self, stock_codes: list) -> None:
+        """通过 baostock 获取每只股票的申万一级行业，写入 stock_basic.industry"""
+        try:
+            from utils.data_sources import BaostockDataSource
+            src = BaostockDataSource()
+            mapping = src.fetch_stock_industry_map()
+            if not mapping:
+                logger.warning("baostock 未返回行业映射，跳过行业写入")
+                return
+            updated = 0
+            with self.db_manager.transaction():
+                for code in stock_codes:
+                    industry = mapping.get(code)
+                    if not industry:
+                        continue
+                    try:
+                        self.db_manager.execute(
+                            "UPDATE stock_basic SET industry=?, update_time=CURRENT_TIMESTAMP WHERE code=?",
+                            (industry, code),
+                        )
+                        updated += 1
+                    except Exception as e:
+                        logger.debug(f"更新 {code} 行业失败: {e}")
+            logger.info(f"行业数据初始化完成: 更新 {updated}/{len(stock_codes)} 只")
+        except Exception as e:
+            logger.error(f"行业数据初始化失败: {e}")
     
     def _init_sector_data(self, stock_codes: list) -> None:
         """
@@ -567,14 +592,12 @@ class DataInitializer:
     
     def _update_industry_data(self, stock_codes: list) -> None:
         """
-        更新行业数据
+        更新行业数据（与初始化共用 baostock 行业映射写入逻辑）
         
         参数：
             stock_codes: 股票代码列表
         """
-        logger.info("更新行业数据...")
-        # TODO: 实现行业数据更新逻辑
-        logger.info("行业数据更新完成")
+        self._write_industry_to_stock_basic(stock_codes)
     
     def _update_sector_data(self, stock_codes: list) -> None:
         """

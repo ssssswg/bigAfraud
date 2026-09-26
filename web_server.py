@@ -4,6 +4,7 @@ Web 服务器 - A股量化选股系统前端
 from trading.strategy_runner import StrategyRunner
 from flask import Flask, render_template, jsonify, request, send_from_directory
 from flask_socketio import SocketIO, emit
+from utils.tushare_client import get_pro
 import json
 import sys
 import math
@@ -667,7 +668,7 @@ def get_stock_detail(code):
             logger.info(f"数据库中无 {code} 数据，尝试从Tushare获取")
             try:
                 import tushare as ts
-                pro = ts.pro_api()
+                pro = get_pro()
                 # 转换代码格式：000001 -> 000001.SZ, 600000 -> 600000.SH
                 if not code.endswith(('.SH', '.SZ')):
                     if code.startswith('6'):

@@ -3,6 +3,7 @@
 实现量化策略的自动化回测功能
 """
 
+from utils.tushare_client import get_pro
 import sqlite3
 from datetime import datetime, date, timedelta
 import logging
@@ -891,7 +892,7 @@ class BacktestEngine:
             logger.info(f"加载交易日历范围: {extended_start} 至 {end_date_str}")
             
             # 获取交易日历（只获取交易日）
-            pro = ts.pro_api(tushare_token)
+            pro = get_pro(tushare_token)
             df = pro.trade_cal(
                 exchange='SSE',
                 start_date=extended_start,
@@ -1903,7 +1904,7 @@ class BacktestEngine:
                     pass
                 
                 if tushare_token:
-                    pro = ts.pro_api(tushare_token)
+                    pro = get_pro(tushare_token)
                     df = pro.daily(
                         ts_code=f"{stock_code}.SH" if stock_code.startswith('6') else f"{stock_code}.SZ",
                         start_date=date_str,

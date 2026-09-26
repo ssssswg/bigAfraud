@@ -1,6 +1,7 @@
 """
 资金流向数据采集器 - 获取和保存个股、行业、板块资金流向数据
 """
+from utils.tushare_client import get_pro
 import pandas as pd
 import logging
 from typing import Optional, Any
@@ -67,7 +68,7 @@ class FundFlowFetcher(DataFetcher):
                     return None
                 
                 # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                pro = get_pro(token)
             
             # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
@@ -107,7 +108,6 @@ class FundFlowFetcher(DataFetcher):
                             logger.debug(f"获取 {current_date_str} 的个股资金流向数据: {len(df_daily)} 条")
                     
                     # 添加延迟，避免触发速率限制
-                    time.sleep(0.3)
                     
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的个股资金流向数据失败: {e}")
@@ -165,7 +165,7 @@ class FundFlowFetcher(DataFetcher):
                     return None
                 
                 # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                pro = get_pro(token)
             
             # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
@@ -190,7 +190,6 @@ class FundFlowFetcher(DataFetcher):
                         logger.debug(f"获取 {current_date_str} 的行业资金流向数据: {len(df_daily)} 条")
                     
                     # 添加延迟，避免触发速率限制
-                    time.sleep(0.3)
                     
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的行业资金流向数据失败: {e}")
@@ -248,7 +247,7 @@ class FundFlowFetcher(DataFetcher):
                     return None
                 
                 # 创建Tushare API实例
-                pro = ts.pro_api(token)
+                pro = get_pro(token)
             
             # 将日期字符串转换为 datetime 对象
             start_dt = datetime.strptime(start_date, '%Y%m%d')
@@ -273,7 +272,6 @@ class FundFlowFetcher(DataFetcher):
                         logger.debug(f"获取 {current_date_str} 的板块资金流向数据: {len(df_daily)} 条")
                     
                     # 添加延迟，避免触发速率限制
-                    time.sleep(0.3)
                     
                 except Exception as e:
                     logger.warning(f"获取 {current_date_str} 的板块资金流向数据失败: {e}")
@@ -322,7 +320,7 @@ class FundFlowFetcher(DataFetcher):
                 return None
             
             # 创建Tushare API实例
-            pro = ts.pro_api(token)
+            pro = get_pro(token)
             
             # 速率限制
             _tushare_limiter.wait_if_needed()
@@ -456,7 +454,7 @@ class FundFlowFetcher(DataFetcher):
                 return None
             
             # 创建Tushare API实例
-            pro = ts.pro_api(token)
+            pro = get_pro(token)
             
             # 速率限制
             _tushare_limiter.wait_if_needed()

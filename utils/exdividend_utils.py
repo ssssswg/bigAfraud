@@ -7,6 +7,7 @@
 3. 使用相对误差阈值 0.01% 判断是否发生除权
 """
 
+from utils.tushare_client import get_pro
 import logging
 from typing import Optional
 from pathlib import Path
@@ -193,7 +194,7 @@ class ExdividendUtils:
                 logger.debug("Tushare token未配置")
                 return None
             
-            return ts.pro_api(token)
+            return get_pro(token)
             
         except Exception as e:
             logger.debug(f"初始化Tushare API失败: {e}")

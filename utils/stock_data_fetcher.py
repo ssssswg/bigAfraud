@@ -1,6 +1,7 @@
 """
 股票基础数据采集器 - 获取股票列表、价格、历史K线数据
 """
+from utils.tushare_client import get_pro
 import akshare as ak
 import pandas as pd
 import requests
@@ -34,6 +35,18 @@ def _code_to_tf_symbol(code: str) -> str:
         symbol = f"{code}.SZ"
     _CODE_TO_TF_CACHE[code] = symbol
     return symbol
+
+
+def _code_to_tencent_symbol(code: str) -> Optional[str]:
+    """将6位数字代码转换为腾讯行情 symbol（sh.600000 / sz.000001）"""
+    if not code or not code.isdigit() or len(code) != 6:
+        return None
+    if code.startswith('6'):
+        return f"sh{code}"
+    if code.startswith(('0', '3')):
+        return f"sz{code}"
+    # 北交所(8/4等)暂不覆盖，返回 None
+    return None
 
 
 def _tf_symbol_to_code(symbol: str) -> str:
@@ -74,23 +87,16 @@ DEFAULT_STOCK_LIST = {
 
 
 class _TushareRateLimiter:
-    """Tushare API 速率限制器"""
+    """Tushare API 速率限制器（已统一：限流由 get_pro 代理内的全局限流器承担）
 
-    def __init__(self, max_calls: int = 100, period: float = 60.0):
-        self.max_calls = max_calls
-        self.period = period
-        self.calls = []
+    保留 wait_if_needed() 仅为兼容旧调用（fund_flow_fetcher 等），
+    避免在统一限流之外重复扣额度/叠加等待。
+    """
 
     def wait_if_needed(self):
-        import time
-        now = time.time()
-        self.calls = [t for t in self.calls if now - t < self.period]
-        if len(self.calls) >= self.max_calls:
-            sleep_time = self.period - (now - self.calls[0])
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-                self.calls = [t for t in self.calls if time.time() - t < self.period]
-        self.calls.append(time.time())
+        # 统一限流已由 utils.tushare_client.get_pro 的全局 RateLimiter 负责，
+        # 此处为空操作，防止双重限流。
+        pass
 
 
 _tushare_limiter = _TushareRateLimiter()
@@ -332,7 +338,7 @@ class StockDataFetcher:
                     logger.warning("未找到 Tushare token，跳过 Tushare 方法")
                 else:
                     # 初始化 Tushare Pro API
-                    pro = ts.pro_api(tushare_token)
+                    pro = get_pro(tushare_token)
                     
                     # 获取股票基本信息（包含所有上市股票）
                     df = pro.stock_basic(exchange='', list_status='L')
@@ -938,7 +944,47 @@ class StockDataFetcher:
 
         return None
 
-    def get_stock_market_cap(self, max_retries=3) -> dict:
+    def _fetch_market_caps_from_tencent(self, stock_codes, batch_size=60) -> Optional[dict]:
+        """通过腾讯行情接口批量获取总市值（单位：亿元）
+
+        接口：https://qt.gtimg.cn/q=sh600000,sz000001,...
+        返回字段以 ~ 分隔，字段[45] 为总市值（亿元），与 daily_basic 单位一致。
+        单次最多请求 batch_size 个代码，分批拉取。
+        """
+        caps: Dict[str, float] = {}
+        codes = [c for c in stock_codes if _code_to_tencent_symbol(c)]
+        if not codes:
+            return None
+        for i in range(0, len(codes), batch_size):
+            batch = codes[i:i + batch_size]
+            query = ','.join(_code_to_tencent_symbol(c) for c in batch)
+            try:
+                r = requests.get(f"https://qt.gtimg.cn/q={query}", timeout=10)
+                r.encoding = 'gbk'
+                for line in r.text.split(';'):
+                    line = line.strip()
+                    if not line.startswith('v_') or '=' not in line:
+                        continue
+                    key, body = line.split('=', 1)
+                    body = body.strip().strip('"')
+                    parts = body.split('~')
+                    if len(parts) < 46:
+                        continue
+                    try:
+                        mv = float(parts[45])  # 总市值（亿元）
+                    except ValueError:
+                        continue
+                    if mv <= 0:
+                        continue
+                    code = key[4:]  # v_sz000001 -> 000001
+                    if code.isdigit() and len(code) == 6:
+                        caps[code] = mv
+            except Exception as e:
+                logger.warning(f"腾讯获取市值失败(第{i // batch_size + 1}批): {e}")
+            time.sleep(0.3)
+        return caps or None
+
+    def get_stock_market_cap(self, max_retries=3, stock_codes: Optional[list] = None) -> dict:
         """
         从 Tushare daily_basic 接口批量获取股票市值信息
         
@@ -977,14 +1023,20 @@ class StockDataFetcher:
                 
                 if not tushare_token:
                     logger.warning("未找到 Tushare token，跳过 Tushare 方法")
-                    return {}
+                    break
                 
                 # 初始化 Tushare Pro API
-                pro = ts.pro_api(tushare_token)
+                pro = get_pro(tushare_token)
                 
+                # daily_basic 必须带 trade_date，否则镜像接口返回多日历史数据导致市值错乱
+                from utils.trade_date_utils import get_previous_trading_day
+                latest_trade_date = get_previous_trading_day(
+                    datetime.now().strftime('%Y%m%d')
+                ).replace('-', '')
+                logger.debug(f"使用最新交易日 {latest_trade_date} 获取市值")
+
                 # 调用 daily_basic 接口获取所有股票的市值信息
-                # daily_basic 接口返回所有股票的每日基本面指标
-                df = pro.daily_basic(fields='ts_code,total_mv')
+                df = pro.daily_basic(trade_date=latest_trade_date, fields='ts_code,total_mv')
                 
                 if df is not None and not df.empty:
                     # 构建 {code: market_cap} 字典
@@ -1018,6 +1070,14 @@ class StockDataFetcher:
                 logger.debug(f"Tushare daily_basic 失败: {e}")
                 time.sleep(1)
         
+        # Tushare 不可用时的腾讯兜底（免费源，无需 token）
+        if stock_codes:
+            logger.info(f"尝试使用腾讯行情获取 {len(stock_codes)} 只股票市值...")
+            tencent_caps = self._fetch_market_caps_from_tencent(stock_codes)
+            if tencent_caps:
+                logger.info(f"✓ 腾讯获取市值成功: {len(tencent_caps)} 只")
+                return tencent_caps
+
         logger.warning("获取市值信息失败，返回空字典")
         return {}
     
@@ -1045,7 +1105,14 @@ class StockDataFetcher:
         logger.info("开始批量更新股票市值信息...")
         
         # 获取最新市值信息
-        market_caps = self.get_stock_market_cap(max_retries)
+        # 从数据库获取全部股票代码，供 Tushare 失败时腾讯兜底使用
+        stock_codes = []
+        try:
+            rows = db_manager.query("SELECT code FROM stock_basic")
+            stock_codes = [r['code'] for r in rows] if rows else []
+        except Exception as e:
+            logger.warning(f"获取股票代码列表失败: {e}")
+        market_caps = self.get_stock_market_cap(max_retries, stock_codes=stock_codes or None)
         
         if not market_caps:
             logger.warning("未获取到市值信息，更新失败")
@@ -1439,7 +1506,7 @@ class StockDataFetcher:
                 logger.warning("未配置 Tushare token，无法检测除权")
                 return {'exdividend_stocks': [], 'factor_changes': {}, 'message': '未配置 Tushare token'}
 
-            pro = ts.pro_api(token)
+            pro = get_pro(token)
 
             # 如果提供了start_date，则使用它；否则使用前一交易日
             if start_date:

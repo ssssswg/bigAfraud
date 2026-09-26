@@ -12,6 +12,7 @@
 如果数据获取失败，会返回错误而不会使用模拟数据填充。
 """
 
+from utils.tushare_client import get_pro
 import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any, Tuple
@@ -59,7 +60,7 @@ class MarketTemperature:
         if tushare_pro is None:
             try:
                 import tushare as ts
-                self.tushare_pro = ts.pro_api()
+                self.tushare_pro = get_pro()
             except Exception as e:
                 logger.warning(f"初始化Tushare失败: {e}")
     

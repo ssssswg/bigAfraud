@@ -25,6 +25,7 @@
 避免直接依赖 akshare 默认请求头被断开。
 """
 
+from utils.tushare_client import get_pro
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
@@ -239,7 +240,7 @@ class TushareProDataSource(DataSource):
             if not token:
                 logger.warning("未找到 Tushare token 配置，Tushare 数据源不可用")
                 return None
-            return ts.pro_api(token)
+            return get_pro(token)
         except Exception as e:
             logger.warning(f"Tushare API 初始化失败: {e}")
             return None
@@ -614,6 +615,35 @@ class BaostockDataSource(DataSource):
                 bs.logout()
         except Exception as e:
             logger.warning(f"baostock 获取行业数据失败: {e}")
+            return None
+
+    def fetch_stock_industry_map(self) -> Optional[dict]:
+        """通过 baostock 获取每只股票的申万一级行业映射 {code: industry}"""
+        try:
+            import baostock as bs
+            if not self._login():
+                return None
+            try:
+                rs = bs.query_stock_industry()
+                fields = list(rs.fields) if getattr(rs, "fields", None) else []
+                code_idx = fields.index("code") if "code" in fields else 0
+                industry_idx = fields.index("industry") if "industry" in fields else 3
+                mapping = {}
+                while rs.next():
+                    row = rs.get_row_data()
+                    if max(code_idx, industry_idx) >= len(row):
+                        continue
+                    raw_code = row[code_idx]  # "sh.600000"
+                    industry = row[industry_idx]
+                    if not raw_code or not industry:
+                        continue
+                    code = raw_code.split(".")[-1]
+                    mapping[code] = industry
+                return mapping or None
+            finally:
+                bs.logout()
+        except Exception as e:
+            logger.warning(f"baostock 获取行业映射失败: {e}")
             return None
 
     def fetch_fund_flow(self, stock_code: str) -> Optional[Dict]:

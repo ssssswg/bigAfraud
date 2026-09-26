@@ -3,6 +3,7 @@
 资金流向数据访问层
 用于获取同花顺个股资金流向数据
 """
+from utils.tushare_client import get_pro
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
@@ -19,7 +20,7 @@ class MoneyFlowDAO:
         try:
             import tushare as ts
             self.tushare = ts
-            self.pro = ts.pro_api()
+            self.pro = get_pro()
         except Exception as e:
             logger.error(f"Tushare初始化失败: {e}")
             self.pro = None

@@ -5,6 +5,7 @@
 提供判断日期是否为交易日的功能。
 """
 
+from utils.tushare_client import get_pro
 import logging
 from datetime import datetime, timedelta
 from typing import List, Optional
@@ -41,11 +42,11 @@ def is_trading_day(date_str: str) -> bool:
             config_path = Path(__file__).parent.parent / "config" / "tushare_config.json"
             if config_path.exists():
                 import json
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     tushare_config = json.load(f)
                 if 'api_key' in tushare_config:
                     ts.set_token(tushare_config['api_key'])
-            pro = ts.pro_api()
+            pro = get_pro()
             df = pro.trade_cal(
                 start_date=date_str_fmt,
                 end_date=date_str_fmt,
@@ -111,12 +112,12 @@ def get_trading_days(start_date: str, end_date: str) -> List[str]:
             # 尝试从配置文件加载 token
             config_path = Path(__file__).parent.parent / "config" / "tushare_config.json"
             if config_path.exists():
-                with open(config_path, 'r') as f:
+                with open(config_path, 'r', encoding='utf-8') as f:
                     tushare_config = json.load(f)
                 if 'api_key' in tushare_config:
                     ts.set_token(tushare_config['api_key'])
 
-            pro = ts.pro_api()
+            pro = get_pro()
 
             # 一次性获取整个区间的交易日历
             df = pro.trade_cal(

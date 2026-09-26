@@ -24,6 +24,7 @@ import logging
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import tushare as ts
+from utils.tushare_client import get_pro
 import pandas as pd
 
 logging.basicConfig(
@@ -37,19 +38,6 @@ logger = logging.getLogger('limit_up_fetcher')
 # up_stat 为涨停状态（含炸板情况），供后续扩展使用。
 FIELDS = ('ts_code,trade_date,name,close,pct_chg,turnover_ratio,float_mv,'
           'first_time,last_time,open_times,up_stat,limit_times,fd_amount,industry')
-
-
-def get_pro():
-    """从项目配置读取 tushare token 并初始化 Pro API。"""
-    cfg_path = os.path.join('config', 'tushare_config.json')
-    if not os.path.exists(cfg_path):
-        raise FileNotFoundError(f'未找到 tushare 配置: {cfg_path}')
-    with open(cfg_path, 'r', encoding='utf-8') as f:
-        cfg = json.load(f)
-    token = cfg.get('token') or cfg.get('api_key')
-    if not token:
-        raise ValueError('tushare_config.json 中未配置 token/api_key')
-    return ts.pro_api(token)
 
 
 def _to_float(v):

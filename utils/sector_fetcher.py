@@ -6,6 +6,7 @@
 参考 stock-master 项目的 eastmoney_fetcher 实现方式
 """
 
+from utils.tushare_client import get_pro
 import logging
 import math
 import time
@@ -57,9 +58,9 @@ class TushareSectorSource(DataSource):
             
             # 创建pro实例
             if token:
-                self._pro = ts.pro_api(token)
+                self._pro = get_pro(token)
             else:
-                self._pro = ts.pro_api()
+                self._pro = get_pro()
             
             return self._pro
         except Exception as e:

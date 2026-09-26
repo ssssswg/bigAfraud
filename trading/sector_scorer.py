@@ -23,6 +23,7 @@
   - 板块得分 = -100 时，个股直接淘汰
 """
 
+from utils.tushare_client import get_pro
 import json
 import time
 import logging
@@ -153,7 +154,7 @@ class SectorScorer:
         """
         try:
             # 读取 tushare 配置文件
-            with open("config/tushare_config.json", "r") as f:
+            with open("config/tushare_config.json", "r", encoding="utf-8") as f:
                 config = json.load(f)
             # 优先使用 token 字段，兼容 api_key 字段
             token = config.get("token") or config.get("api_key", "")
@@ -175,7 +176,7 @@ class SectorScorer:
             try:
                 import tushare as ts
                 # 使用 token 初始化 pro API
-                self._pro = ts.pro_api(self._token)
+                self._pro = get_pro(self._token)
                 logger.debug("Tushare pro API 初始化成功")
             except Exception as e:
                 logger.error(f"Tushare pro API 初始化失败: {e}")
