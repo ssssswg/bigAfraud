@@ -257,7 +257,8 @@ function setupInitWebSocketListener() {
  * 这是一个备用方式，确保能够及时收到完成状态
  */
 function handleWebSocketInitProgress(data) {
-    if (!initState.isRunning) {
+    // 完成/失败/取消状态始终处理：轮询可能已因空 statistics 抢先锁定 isRunning，需用 WebSocket 携带的正确统计覆盖
+    if (!initState.isRunning && data.status !== 'completed' && data.status !== 'failed' && data.status !== 'cancelled') {
         return;
     }
     

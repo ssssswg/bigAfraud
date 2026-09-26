@@ -52,3 +52,8 @@
 - **问题**：`scripts/collect_limit_up_pool.py` 中自定义 `def get_pro()`（0 参数）同名覆盖了 `utils.tushare_client.get_pro`，导致 `get_pro(token)` 报 `takes 0 positional arguments but 1 was given`，涨停池取数全部失败。
 - **修复**：删除冗余自定义 `get_pro`，统一使用 `utils.tushare_client.get_pro`（自动读取 token + 限流）。
 - **验证**：`fetch_limit_up_day(pro, '20260924')` 返回 52 只涨停股。
+
+### 4. 回测股票池移除配置补齐（pool_removal）
+- **问题**：回测主升低吸等 KHunter 新策略报 `策略 主升低吸策略 未配置股票池移除参数`——`config/pool_removal_config.yaml` 未同步 5 个新增策略；且新策略候选以中文名传入，而配置用类名作 key。
+- **修复**：`config/pool_removal_config.yaml` 补齐 5 个新策略（龙头/主升低吸/低位九转/超跌反弹/趋势共振反转），同时加类名与中文名 key。
+- **验证**：yaml 语法通过，类名与中文名均命中（如 主升低吸策略→5天、龙头策略→5天）。

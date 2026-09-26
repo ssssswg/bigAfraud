@@ -116,4 +116,69 @@ removal_strategies:
     min_hold_days: 15
     is_enabled: true
     remark: "加入股票池15天后验证上升趋势"
+  # 龙头策略
+  LeaderStrategy:
+    display_name: "龙头策略"
+    min_hold_days: 5
+    is_enabled: true
+    remark: "加入股票池5天后验证上升趋势"
+
+  # 主升低吸策略
+  MainUptrendDipBuyStrategy:
+    display_name: "主升低吸策略"
+    min_hold_days: 5
+    is_enabled: true
+    remark: "加入股票池5天后验证上升趋势"
+
+  # 低位九转策略
+  LowTD9Strategy:
+    display_name: "低位九转策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
+
+  # 超跌反弹策略
+  OversoldReboundStrategy:
+    display_name: "超跌反弹策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
+
+  # 趋势共振反转策略（独有）
+  TrendResonanceReversalStrategy:
+    display_name: "趋势共振反转策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
+
+# ---- 以下为 KHunter 新增策略的中文名 key（兼容候选以中文名传入） ----
+  龙头策略:
+    display_name: "龙头策略"
+    min_hold_days: 5
+    is_enabled: true
+    remark: "加入股票池5天后验证上升趋势"
+
+  主升低吸策略:
+    display_name: "主升低吸策略"
+    min_hold_days: 5
+    is_enabled: true
+    remark: "加入股票池5天后验证上升趋势"
+
+  低位九转策略:
+    display_name: "低位九转策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
+
+  超跌反弹策略:
+    display_name: "超跌反弹策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
+
+  趋势共振反转策略:
+    display_name: "趋势共振反转策略"
+    min_hold_days: 15
+    is_enabled: true
+    remark: "加入股票池15天后验证上升趋势"
 

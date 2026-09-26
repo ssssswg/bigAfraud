@@ -513,12 +513,11 @@ class DataCollectionService:
                 self.init_status['progress'] = 100
                 self.init_status['end_time'] = datetime.now().isoformat()
                 self.init_status['message'] = '初始化完成'
+                # 先计算统计信息，再置 completed，确保任何 completed 响应都携带统计
+                self.init_status['statistics'] = self.get_tables_stats()
                 self.init_status['status'] = 'completed'
                 self.init_status['success'] = 1
                 self._add_init_log("✓ 初始化任务完成")
-                
-                # 更新统计信息
-                self.init_status['statistics'] = self.get_tables_stats()
                 
                 # 尝试导入并调用WebSocket推送函数
                 try:
