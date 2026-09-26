@@ -70,6 +70,10 @@ EVENT_VALIDITY = {
     "block_trade": 5,       # 大宗交易有效期
     "top_list": 5,          # 龙虎榜有效期
     "shock": 10,            # 异常波动有效期
+    "share_float": 15,      # 限售股解禁有效期
+    "holder_number": 30,    # 股东人数有效期
+    "top_inst": 5,          # 龙虎榜机构席位有效期
+    "express": 20,          # 业绩快报有效期
 }
 
 # 正面事件加分配置
@@ -79,6 +83,9 @@ POSITIVE_SCORES = {
     "股票回购": 10,          # 股票回购
     "股东增持": 20,          # 股东增持
     "龙虎榜机构净买入": 10,  # 龙虎榜机构净买入
+    "股东户数减少": 10,     # 股东户数环比下降（筹码集中）
+    "业绩快报预增": 15,     # 业绩快报大幅增长
+    "业绩快报略增": 8,      # 业绩快报小幅增长
 }
 
 # 负面事件减分配置
@@ -90,6 +97,11 @@ NEGATIVE_SCORES = {
     "异常波动": -15,         # 异常波动公告
     "大宗交易折价": -10,     # 大宗交易折价>5%
     "龙虎榜净卖出": -10,     # 龙虎榜净卖出
+    "限售股解禁": -10,      # 限售股解禁（抛压）
+    "股东户数增加": -10,    # 股东户数环比上升（筹码分散）
+    "龙虎榜机构净卖出": -10, # 机构专用席位净卖出
+    "业绩快报预减": -15,    # 业绩快报大幅下滑
+    "业绩快报略减": -8,     # 业绩快报小幅下滑
 }
 
 # Tushare API 重试配置
@@ -141,8 +153,8 @@ class MemoryCache:
         """
         if key in self._cache:
             data, timestamp = self._cache[key]
-            # 检查是否过期
-            if time.time() - timestamp < self._ttl:
+            # 检查是否过期（timestamp 为当日 24:00 时间戳，跨日自动失效）
+            if time.time() < timestamp:
                 return data
             # 过期则删除
             del self._cache[key]
@@ -156,8 +168,11 @@ class MemoryCache:
             key: 缓存键
             value: 缓存值
         """
-        # 存储数据和时间戳
-        self._cache[key] = (value, time.time())
+        # 存储数据，有效期到当日 24:00（跨日自动失效，与 Tushare 每日更新一次的频率对齐）
+        import datetime as _dt
+        tomorrow = _dt.datetime.now() + _dt.timedelta(days=1)
+        end_of_day = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        self._cache[key] = (value, end_of_day)
 
 
 class EventScorer:
@@ -398,6 +413,17 @@ class EventScorer:
         ts_code = self._convert_ts_code(stock_code)
         events = []
 
+        # 读库优先：业绩预告已入库则直接读库，避免逐股实时调接口
+        is_ready, local_rows = self._query_local_events('业绩预告', stock_code, start_date, score_date)
+        if is_ready:
+            events = []
+            for row in local_rows:
+                ev = self._parse_forecast_event(row)
+                if ev:
+                    events.append(ev)
+            self._cache.set(cache_key, events)
+            return events
+
         try:
             pro = self._get_pro()
             # 调用 forecast 接口获取业绩预告
@@ -510,6 +536,17 @@ class EventScorer:
         ts_code = self._convert_ts_code(stock_code)
         events = []
 
+        # 读库优先：股东增减持已入库则直接读库
+        is_ready, local_rows = self._query_local_events('股东增减持', stock_code, start_date, score_date)
+        if is_ready:
+            events = []
+            for row in local_rows:
+                ev = self._parse_holdertrade_event(row)
+                if ev:
+                    events.append(ev)
+            self._cache.set(cache_key, events)
+            return events
+
         try:
             pro = self._get_pro()
             # 调用 stk_holdertrade 接口
@@ -601,6 +638,14 @@ class EventScorer:
         ts_code = self._convert_ts_code(stock_code)
         events = []
 
+        # 读库优先：股票回购已入库则直接读库
+        is_ready, local_rows = self._query_local_events('股票回购', stock_code, start_date, score_date)
+        if is_ready:
+            events = [{"type": "股票回购", "score": POSITIVE_SCORES["股票回购"],
+                       "date": r.get("ann_date", r.get("event_date", ""))} for r in local_rows]
+            self._cache.set(cache_key, events)
+            return events
+
         try:
             pro = self._get_pro()
             # 调用 repurchase 接口
@@ -658,23 +703,25 @@ class EventScorer:
         try:
             pro = self._get_pro()
             # 调用 block_trade 接口
-            df = self._call_tushare_with_retry(
-                pro.block_trade, ts_code=ts_code,
-                start_date=start_date, end_date=score_date,
-                fields="ts_code,trade_date,price,vol,amount,buyer,seller,premium",
-            )
-            if df is None or df.empty:
-                logger.debug(f"无大宗交易数据: {stock_code}")
-                self._cache.set(cache_key, events)
-                return events
-            # 遍历每条大宗交易记录
-            for _, row in df.iterrows():
-                premium = self._safe_float(row.get("premium"), 0)
-                trade_date = str(row.get("trade_date", ""))
-                # 折价超过5%为负面事件（premium 为负表示折价）
-                if premium < -BLOCK_TRADE_DISCOUNT_THRESHOLD:
-                    events.append({"type": "大宗交易折价", "score": NEGATIVE_SCORES["大宗交易折价"],
-                                   "date": trade_date, "premium": premium})
+            from utils.tushare_bulk_cache import daily_bulk
+            from utils.trade_date_utils import get_trading_days
+            for d in get_trading_days(start_date, score_date):
+                trade_date = d.replace('-', '')
+                df = daily_bulk.get(
+                    pro, 'block_trade', trade_date,
+                    fields="ts_code,trade_date,price,vol,amount,buyer,seller,premium",
+                )
+                if df is None or df.empty:
+                    continue
+                sub = df[df['ts_code'] == ts_code] if 'ts_code' in df.columns else df
+                # 遍历每条大宗交易记录
+                for _, row in sub.iterrows():
+                    premium = self._safe_float(row.get("premium"), 0)
+                    td = str(row.get("trade_date", ""))
+                    # 折价超过5%为负面事件（premium 为负表示折价）
+                    if premium < -BLOCK_TRADE_DISCOUNT_THRESHOLD:
+                        events.append({"type": "大宗交易折价", "score": NEGATIVE_SCORES["大宗交易折价"],
+                                       "date": td, "premium": premium})
             logger.debug(f"大宗交易事件: {stock_code}, {len(events)} 条")
         except Exception as e:
             logger.error(f"大宗交易查询失败: {stock_code}, {e}")
@@ -701,28 +748,27 @@ class EventScorer:
         events = []
         try:
             pro = self._get_pro()
-            # top_list 接口需要 trade_date 参数，需要逐个日期查询
-            # 获取有效期内的所有交易日
-            from datetime import datetime, timedelta
-            start_dt = datetime.strptime(start_date, "%Y%m%d")
-            end_dt = datetime.strptime(score_date, "%Y%m%d")
-            current_dt = start_dt
-            while current_dt <= end_dt:
-                trade_date = current_dt.strftime("%Y%m%d")
-                df = self._call_tushare_with_retry(
-                    pro.top_list, ts_code=ts_code, trade_date=trade_date,
+            # top_list 支持 trade_date 全市场查询，按交易日全市场批量拉取并缓存，
+            # 同评分日多只股票共享同一份数据，大幅减少请求次数。
+            from utils.tushare_bulk_cache import daily_bulk
+            from utils.trade_date_utils import get_trading_days
+            trading_days = get_trading_days(start_date, score_date)  # YYYY-MM-DD
+            for d in trading_days:
+                trade_date = d.replace('-', '')
+                df = daily_bulk.get(
+                    pro, 'top_list', trade_date,
                     fields="ts_code,trade_date,name,buy,sell,net_buy",
                 )
                 if df is not None and not df.empty:
-                    # 遍历每条龙虎榜记录
-                    for _, row in df.iterrows():
+                    # 过滤本股票记录（全市场龙虎榜）
+                    sub = df[df['ts_code'] == ts_code] if 'ts_code' in df.columns else df
+                    for _, row in sub.iterrows():
                         net_buy = self._safe_float(row.get("net_buy"), 0)
-                        trade_date_str = str(row.get("trade_date", ""))
+                        td_str = str(row.get("trade_date", ""))
                         if net_buy > 0:
-                            events.append({"type": "龙虎榜机构净买入", "score": POSITIVE_SCORES["龙虎榜机构净买入"], "date": trade_date_str})
+                            events.append({"type": "龙虎榜机构净买入", "score": POSITIVE_SCORES["龙虎榜机构净买入"], "date": td_str})
                         elif net_buy < 0:
-                            events.append({"type": "龙虎榜净卖出", "score": NEGATIVE_SCORES["龙虎榜净卖出"], "date": trade_date_str})
-                current_dt += timedelta(days=1)
+                            events.append({"type": "龙虎榜净卖出", "score": NEGATIVE_SCORES["龙虎榜净卖出"], "date": td_str})
             logger.debug(f"龙虎榜事件: {stock_code}, {len(events)} 条")
         except Exception as e:
             logger.error(f"龙虎榜查询失败: {stock_code}, {e}")
@@ -748,31 +794,243 @@ class EventScorer:
         events = []
         try:
             pro = self._get_pro()
-            df = self._call_tushare_with_retry(
-                pro.stk_shock, ts_code=ts_code,
-                fields="ts_code,ann_date,shock_reason",
-            )
-            if df is None or df.empty:
-                logger.debug(f"无异常波动数据: {stock_code}")
-                self._cache.set(cache_key, events)
-                return events
-            # 过滤有效期内的记录
-            df = self._filter_by_date(df, "ann_date", start_date, score_date)
-            if df.empty:
-                self._cache.set(cache_key, events)
-                return events
-            for _, row in df.iterrows():
-                ann_date = str(row.get("ann_date", ""))
-                events.append({"type": "异常波动", "score": NEGATIVE_SCORES["异常波动"], "date": ann_date})
+            from utils.tushare_bulk_cache import daily_bulk
+            from utils.trade_date_utils import get_trading_days
+            for d in get_trading_days(start_date, score_date):
+                trade_date = d.replace('-', '')
+                df = daily_bulk.get(
+                    pro, 'stk_shock', trade_date,
+                    fields="ts_code,ann_date,shock_reason",
+                )
+                if df is None or df.empty:
+                    continue
+                sub = df[df['ts_code'] == ts_code] if 'ts_code' in df.columns else df
+                for _, row in sub.iterrows():
+                    ann_date = str(row.get("ann_date", ""))
+                    events.append({"type": "异常波动", "score": NEGATIVE_SCORES["异常波动"], "date": ann_date})
             logger.debug(f"异常波动事件: {stock_code}, {len(events)} 条")
         except Exception as e:
             logger.error(f"异常波动查询失败: {stock_code}, {e}")
         self._cache.set(cache_key, events)
         return events
 
+    def _check_share_float(self, stock_code: str, score_date: str) -> List[dict]:
+        """限售股解禁事件（读库优先）。解禁日临近 → 浮筹增加抛压，负面。有效期15天"""
+        cache_key = f"share_float_{stock_code}_{score_date}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        start_date = self._get_start_date(score_date, EVENT_VALIDITY["share_float"])
+        events = []
+        is_ready, local_rows = self._query_local_events('限售股解禁', stock_code, start_date, score_date)
+        if is_ready:
+            for row in local_rows:
+                fd = str(row.get("float_date") or row.get("ann_date") or "")
+                if fd and start_date <= fd <= score_date:
+                    events.append({"type": "限售股解禁", "score": NEGATIVE_SCORES["限售股解禁"], "date": fd})
+            self._cache.set(cache_key, events)
+            return events
+        try:
+            pro = self._get_pro()
+            df = self._call_tushare_with_retry(
+                pro.share_float, ts_code=self._convert_ts_code(stock_code),
+                fields="ts_code,ann_date,float_date,float_share,float_ratio")
+            if df is not None and not df.empty:
+                df = self._filter_by_date(df, "float_date", start_date, score_date)
+                for _, row in df.iterrows():
+                    fd = str(row.get("float_date", ""))
+                    events.append({"type": "限售股解禁", "score": NEGATIVE_SCORES["限售股解禁"], "date": fd})
+        except Exception as e:
+            logger.error(f"限售股解禁查询失败: {stock_code}, {e}")
+        self._cache.set(cache_key, events)
+        return events
+
+    def _check_holder_number(self, stock_code: str, score_date: str) -> List[dict]:
+        """股东户数变化事件（读库优先）。户数环比下降=筹码集中→正面，上升→负面。有效期30天"""
+        cache_key = f"holder_number_{stock_code}_{score_date}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        start_date = self._get_start_date(score_date, EVENT_VALIDITY["holder_number"])
+        events = []
+        is_ready, local_rows = self._query_local_events('股东人数', stock_code, start_date, score_date)
+        if is_ready:
+            ordered = sorted(local_rows, key=lambda r: str(r.get("ann_date", "")), reverse=True)
+            latest = self._safe_float(ordered[0].get("holder_num")) if ordered else 0
+            prev = self._safe_float(ordered[1].get("holder_num")) if len(ordered) > 1 else 0
+            if latest and prev and latest != prev:
+                ad = str(ordered[0].get("ann_date", ""))
+                if latest < prev:
+                    events.append({"type": "股东户数减少", "score": POSITIVE_SCORES["股东户数减少"], "date": ad})
+                else:
+                    events.append({"type": "股东户数增加", "score": NEGATIVE_SCORES["股东户数增加"], "date": ad})
+            self._cache.set(cache_key, events)
+            return events
+        try:
+            pro = self._get_pro()
+            df = self._call_tushare_with_retry(
+                pro.stk_holdernumber, ts_code=self._convert_ts_code(stock_code),
+                fields="ts_code,ann_date,holder_num")
+            if df is not None and not df.empty:
+                df = self._filter_by_date(df, "ann_date", start_date, score_date)
+                if len(df) > 1:
+                    latest = self._safe_float(df.iloc[0].get("holder_num"))
+                    prev = self._safe_float(df.iloc[1].get("holder_num"))
+                    if latest and prev and latest != prev:
+                        ad = str(df.iloc[0].get("ann_date", ""))
+                        if latest < prev:
+                            events.append({"type": "股东户数减少", "score": POSITIVE_SCORES["股东户数减少"], "date": ad})
+                        else:
+                            events.append({"type": "股东户数增加", "score": NEGATIVE_SCORES["股东户数增加"], "date": ad})
+        except Exception as e:
+            logger.error(f"股东户数查询失败: {stock_code}, {e}")
+        self._cache.set(cache_key, events)
+        return events
+
+    def _check_top_inst(self, stock_code: str, score_date: str) -> List[dict]:
+        """龙虎榜机构席位事件（读库优先）。机构专用席位净买入→正面，净卖出→负面。有效期5天"""
+        cache_key = f"top_inst_{stock_code}_{score_date}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        start_date = self._get_start_date(score_date, EVENT_VALIDITY["top_inst"])
+        events = []
+        is_ready, local_rows = self._query_local_events('龙虎榜机构', stock_code, start_date, score_date)
+        if is_ready:
+            inst_buy = inst_sell = 0.0
+            last_date = ""
+            for row in local_rows:
+                if "机构专用" in str(row.get("exalter", "")):
+                    inst_buy += self._safe_float(row.get("buy"), 0)
+                    inst_sell += self._safe_float(row.get("sell"), 0)
+                    last_date = str(row.get("trade_date") or row.get("event_date") or "")
+            if inst_buy or inst_sell:
+                if inst_buy > inst_sell:
+                    events.append({"type": "龙虎榜机构净买入", "score": POSITIVE_SCORES["龙虎榜机构净买入"], "date": last_date})
+                elif inst_sell > inst_buy:
+                    events.append({"type": "龙虎榜机构净卖出", "score": NEGATIVE_SCORES["龙虎榜机构净卖出"], "date": last_date})
+            self._cache.set(cache_key, events)
+            return events
+        try:
+            pro = self._get_pro()
+            from utils.tushare_bulk_cache import daily_bulk
+            from utils.trade_date_utils import get_trading_days
+            inst_buy = inst_sell = 0.0
+            last_date = ""
+            for d in get_trading_days(start_date, score_date):
+                df = daily_bulk.get(pro, 'top_inst', d.replace('-', ''),
+                                    fields="ts_code,trade_date,exalter,buy,sell")
+                if df is None or df.empty:
+                    continue
+                sub = df[df['ts_code'] == self._convert_ts_code(stock_code)] if 'ts_code' in df.columns else df
+                for _, row in sub.iterrows():
+                    if "机构专用" in str(row.get("exalter", "")):
+                        inst_buy += self._safe_float(row.get("buy"), 0)
+                        inst_sell += self._safe_float(row.get("sell"), 0)
+                        last_date = str(row.get("trade_date", ""))
+            if inst_buy or inst_sell:
+                if inst_buy > inst_sell:
+                    events.append({"type": "龙虎榜机构净买入", "score": POSITIVE_SCORES["龙虎榜机构净买入"], "date": last_date})
+                elif inst_sell > inst_buy:
+                    events.append({"type": "龙虎榜机构净卖出", "score": NEGATIVE_SCORES["龙虎榜机构净卖出"], "date": last_date})
+        except Exception as e:
+            logger.error(f"龙虎榜机构查询失败: {stock_code}, {e}")
+        self._cache.set(cache_key, events)
+        return events
+
+    def _check_express(self, stock_code: str, score_date: str) -> List[dict]:
+        """业绩快报事件（读库优先）。yoy_net_profit 大幅增长→正面，下滑→负面。有效期20天"""
+        cache_key = f"express_{stock_code}_{score_date}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        start_date = self._get_start_date(score_date, EVENT_VALIDITY["express"])
+        events = []
+        is_ready, local_rows = self._query_local_events('业绩快报', stock_code, start_date, score_date)
+        if is_ready:
+            for row in local_rows:
+                yoy = self._safe_float(row.get("yoy_net_profit"), None)
+                if yoy is None:
+                    continue
+                ad = str(row.get("ann_date") or row.get("event_date") or "")
+                if yoy > 30:
+                    events.append({"type": "业绩快报预增", "score": POSITIVE_SCORES["业绩快报预增"], "date": ad})
+                elif yoy > 0:
+                    events.append({"type": "业绩快报略增", "score": POSITIVE_SCORES["业绩快报略增"], "date": ad})
+                elif yoy < -30:
+                    events.append({"type": "业绩快报预减", "score": NEGATIVE_SCORES["业绩快报预减"], "date": ad})
+                elif yoy < 0:
+                    events.append({"type": "业绩快报略减", "score": NEGATIVE_SCORES["业绩快报略减"], "date": ad})
+            self._cache.set(cache_key, events)
+            return events
+        try:
+            pro = self._get_pro()
+            df = self._call_tushare_with_retry(
+                pro.express, ts_code=self._convert_ts_code(stock_code),
+                fields="ts_code,ann_date,yoy_net_profit")
+            if df is not None and not df.empty:
+                df = self._filter_by_date(df, "ann_date", start_date, score_date)
+                for _, row in df.iterrows():
+                    yoy = self._safe_float(row.get("yoy_net_profit"), None)
+                    if yoy is None:
+                        continue
+                    ad = str(row.get("ann_date", ""))
+                    if yoy > 30:
+                        events.append({"type": "业绩快报预增", "score": POSITIVE_SCORES["业绩快报预增"], "date": ad})
+                    elif yoy > 0:
+                        events.append({"type": "业绩快报略增", "score": POSITIVE_SCORES["业绩快报略增"], "date": ad})
+                    elif yoy < -30:
+                        events.append({"type": "业绩快报预减", "score": NEGATIVE_SCORES["业绩快报预减"], "date": ad})
+                    elif yoy < 0:
+                        events.append({"type": "业绩快报略减", "score": NEGATIVE_SCORES["业绩快报略减"], "date": ad})
+        except Exception as e:
+            logger.error(f"业绩快报查询失败: {stock_code}, {e}")
+        self._cache.set(cache_key, events)
+        return events
+
     # ============================================================
     # 辅助方法
     # ============================================================
+
+    def _query_local_events(self, event_type: str, stock_code: str,
+                            start_date: str, end_date: str) -> tuple:
+        """
+        从 stock_event 表查询某股票在窗口内的事件（读库优先）。
+
+        返回 (is_ready, rows)：
+          - is_ready=True 表示该事件类型已入库（本地可信，未命中即确无事件）
+          - rows 为原始字段 dict 列表（从 event_content JSON 恢复）
+        """
+        try:
+            from utils.global_db import get_global_db
+            db = get_global_db()
+        except Exception:
+            return False, []
+        # 已纳入事件入库的事件类型（与 EventDataFetcher.APIS 一致），读库优先。
+        # 表里无记录 = 该窗口确无事件，直接返回空，避免逐股实时调接口。
+        LOCAL_EVENT_TYPES = {'业绩预告', '股东增减持', '股票回购', '业绩快报', '限售股解禁', '股东人数', '龙虎榜机构'}
+        if event_type not in LOCAL_EVENT_TYPES:
+            return False, []
+        try:
+            q = db.query(
+                "SELECT event_content, event_date FROM stock_event "
+                "WHERE stock_code=? AND event_type=? AND event_date BETWEEN ? AND ?",
+                (stock_code, event_type, start_date, end_date))
+        except Exception:
+            return False, []
+        rows = []
+        for r in (q or []):
+            try:
+                d = json.loads(r.get('event_content') or '{}')
+                d['stock_code'] = stock_code
+                if 'ann_date' not in d:
+                    d['ann_date'] = str(r.get('event_date', ''))
+                if 'trade_date' not in d:
+                    d['trade_date'] = str(r.get('event_date', ''))
+                rows.append(d)
+            except Exception:
+                continue
+        return True, rows
 
     def _filter_by_date(self, df: pd.DataFrame, date_col: str,
                         start_date: str, end_date: str) -> pd.DataFrame:
@@ -865,6 +1123,10 @@ class EventScorer:
         all_events.extend(self._check_block_trade(stock_code, score_date))
         all_events.extend(self._check_top_list(stock_code, score_date))
         all_events.extend(self._check_shock(stock_code, score_date))
+        all_events.extend(self._check_share_float(stock_code, score_date))
+        all_events.extend(self._check_holder_number(stock_code, score_date))
+        all_events.extend(self._check_top_inst(stock_code, score_date))
+        all_events.extend(self._check_express(stock_code, score_date))
         return all_events
 
     def check_veto(self, stock_code: str, score_date: str) -> Tuple[bool, str]:

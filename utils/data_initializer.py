@@ -436,12 +436,12 @@ class DataInitializer:
     
     def _init_fund_flow_data(self, stock_codes: list, include_industry_sector: bool = True) -> dict:
         """
-        初始化资金流向数据
-        
+        初始化资金流向数据（复用 FundFlowUpdater 增量逻辑，按交易日批量拉取入库）
+
         参数：
             stock_codes: 股票代码列表
             include_industry_sector: 是否包括行业和板块资金流向
-        
+
         返回：
             初始化统计信息字典
         """
@@ -451,31 +451,102 @@ class DataInitializer:
             'industry_moneyflow': 0,
             'sector_moneyflow': 0
         }
-        
+
         try:
-            # TODO: 实现资金流向数据初始化逻辑
-            logger.info("资金流向数据初始化完成")
+            from utils.fund_flow_updater import FundFlowUpdater
+            from utils.fund_flow_fetcher import FundFlowFetcher
+
+            fetcher = self.fund_flow_fetcher
+            if fetcher is None:
+                fetcher = FundFlowFetcher(self.db_manager)
+            updater = FundFlowUpdater(self.db_manager, fetcher)
+
+            # 初始化覆盖近 60 个交易日到当前，写入 stock_fund_flow 等表
+            target = datetime.now().strftime('%Y-%m-%d')
+            last = (datetime.now() - timedelta(days=60)).strftime('%Y-%m-%d')
+            result = updater.update_fund_flow_data(last_update_date=last, target_date=target)
+
+            stats['stock_moneyflow'] = result.get('added', 0) + result.get('updated', 0)
+            logger.info(f"资金流向数据初始化完成: {result.get('message', '')}")
         except Exception as e:
             logger.error(f"初始化资金流向数据失败: {e}")
-        
+
         return stats
     
     # ==================== 事件数据初始化 ====================
     
-    def _init_event_data(self, stock_codes: list) -> dict:
+    def _init_event_data(self, stock_codes: list, incremental: bool = False) -> dict:
         """
-        初始化事件数据（暂时不可用）
-        Tushare anns_d 接口权限未开通，暂时跳过事件数据初始化
-        
+        初始化事件数据（Tushare 9 类事件按日批量入库 stock_event）
+
         参数：
             stock_codes: 股票代码列表
-        
+            incremental: 是否增量更新（增量只拉 stock_event 最新日期之后的事件）
+
         返回：
             初始化统计信息字典
         """
-        logger.info("事件数据初始化暂时跳过（Tushare 权限未开通）")
-        return {'event_data': 0}
+        logger.info("开始初始化事件数据...")
+        try:
+            from utils.event_data_fetcher import EventDataFetcher
+            fetcher = EventDataFetcher(self.db_manager)
+            end = datetime.now()
+            if incremental:
+                # 增量：只拉已有事件最新日期之后，避免重复拉取
+                row = self.db_manager.query_one("SELECT MAX(event_date) m FROM stock_event")
+                if row and row.get('m'):
+                    latest = datetime.strptime(str(row['m'])[:8], '%Y%m%d') + timedelta(days=1)
+                    if latest >= end:
+                        logger.info("事件数据已是最新，无需增量更新")
+                        return {'event_data': 0}
+                    start = latest
+                else:
+                    start = end - timedelta(days=90)
+            else:
+                # 全量：覆盖近 90 天
+                start = end - timedelta(days=90)
+            stats = fetcher.fetch_range(start.strftime('%Y%m%d'), end.strftime('%Y%m%d'))
+            return {'event_data': stats.get('added', 0)}
+        except Exception as e:
+            logger.error(f"初始化事件数据失败: {e}")
+            return {'event_data': 0}
     
+    def _init_financial_data(self, stock_codes: list, incremental: bool = False) -> dict:
+        """
+        初始化财务数据（后台线程执行，不阻塞初始化主流程）。
+
+        - 全量：逐股拉全市场财务写 stock_financial（镜像 fina_indicator 仅支持 ts_code，耗时较长）
+        - 增量：只对传入的新股票拉取
+
+        参数：
+            stock_codes: 股票代码列表
+            incremental: 是否增量更新
+
+        返回：
+            初始化统计信息字典（后台执行，立即返回 financial=0）
+        """
+        logger.info("财务数据初始化转入后台执行...")
+
+        def _run():
+            try:
+                from utils.financial_data_fetcher import FinancialDataFetcher
+                fetcher = FinancialDataFetcher(self.db_manager)
+                if incremental and stock_codes:
+                    cnt = 0
+                    for c in stock_codes:
+                        cnt += fetcher.fetch_for_stock(str(c))
+                    stats = {'added': cnt, 'failed': 0}
+                else:
+                    stats = fetcher.fetch_all_stocks()
+                logger.info(f"后台财务初始化完成: {stats}")
+            except Exception as e:
+                logger.error(f"后台财务初始化失败: {e}")
+
+        import threading
+        t = threading.Thread(target=_run, name='financial-init', daemon=True)
+        t.start()
+        return {'financial': 0}
+
     # ==================== 统一初始化入口 ====================
     
     def init_full_data(self, max_stocks: Optional[int] = None, years: int = 3,
@@ -563,8 +634,13 @@ class DataInitializer:
             
             # 6. 初始化事件数据
             self._report_progress(stages[5], "正在初始化事件数据...")
-            self._init_event_data(stock_codes)
+            self._init_event_data(stock_codes, incremental=incremental)
             self._report_progress(stages[6], "事件数据初始化完成")
+            
+            # 7. 初始化财务数据
+            self._report_progress(stages[5], "正在初始化财务数据...")
+            self._init_financial_data(stock_codes, incremental=incremental)
+            self._report_progress(stages[6], "财务数据初始化完成")
             
             logger.info(f"{mode}初始化完成")
         

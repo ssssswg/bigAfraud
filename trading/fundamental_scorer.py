@@ -79,8 +79,8 @@ class MemoryCache:
         """
         if key in self._cache:
             data, timestamp = self._cache[key]
-            # 检查是否过期
-            if time.time() - timestamp < self._ttl:
+            # 检查是否过期（timestamp 为当日 24:00 时间戳，跨日自动失效）
+            if time.time() < timestamp:
                 return data
             # 过期则删除
             del self._cache[key]
@@ -94,8 +94,11 @@ class MemoryCache:
             key: 缓存键
             value: 缓存值
         """
-        # 存储数据和时间戳
-        self._cache[key] = (value, time.time())
+        # 存储数据，有效期到当日 24:00（跨日自动失效，与 Tushare 每日更新一次的频率对齐）
+        import datetime as _dt
+        tomorrow = _dt.datetime.now() + _dt.timedelta(days=1)
+        end_of_day = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        self._cache[key] = (value, end_of_day)
 
 
 class FundamentalScorer:
@@ -228,6 +231,23 @@ class FundamentalScorer:
         if cached is not None:
             logger.debug(f"命中缓存: {cache_key}")
             return cached
+
+        # 读库优先：财务数据已入库则直接读库，避免实时调接口
+        try:
+            from utils.global_db import get_global_db
+            db = get_global_db()
+            rows = db.query(
+                "SELECT ann_date, end_date, roe, netprofit_yoy, ocfps, eps, ocf_to_opincome "
+                "FROM stock_financial WHERE stock_code=? ORDER BY ann_date DESC",
+                (stock_code,))
+            if rows:
+                df = pd.DataFrame(rows)
+                df['ts_code'] = self._convert_ts_code(stock_code)
+                self._cache.set(cache_key, df)
+                logger.debug(f"命中财务读库: {stock_code}, {len(df)} 期")
+                return df
+        except Exception:
+            pass
 
         # 转换为 Tushare 格式代码
         ts_code = self._convert_ts_code(stock_code)

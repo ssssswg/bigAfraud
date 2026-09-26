@@ -53,6 +53,9 @@ class KlineUpdater:
             'percentage': 0
         }
 
+        # 并发拉取批次数（TickFlow 请求并发，保存仍主线程串行，不争 DB 写锁）
+        self.fetch_concurrency = 3
+
     def update_kline_data(self, stock_codes: List[str], last_update_date: str, target_date: str, batch_size: int = 100) -> Dict:
         """
         增量更新K线数据
@@ -126,36 +129,37 @@ class KlineUpdater:
             
             logger.info(f"需要获取 {days_to_fetch} 天的K线数据")
             
-            # 第2步：分批批量处理（TickFlow API）
-            logger.info(f"第2步: TickFlow 批量处理 {len(stock_codes)} 只股票 (批次大小: {batch_size})...")
+            # 第2步：分批批量处理（TickFlow API）——并发拉批 + 主线程串行保存
+            from concurrent.futures import ThreadPoolExecutor
+            logger.info(f"第2步: TickFlow 批量处理 {len(stock_codes)} 只股票 (批次大小: {batch_size}, 拉取并发: {self.fetch_concurrency})...")
             self.progress['total'] = len(stock_codes)
-            
-            for batch_idx in range(0, len(stock_codes), batch_size):
-                # 获取该批股票
-                batch_codes = stock_codes[batch_idx:batch_idx + batch_size]
-                batch_num = batch_idx // batch_size + 1
-                total_batches = (len(stock_codes) + batch_size - 1) // batch_size
-                
-                # 更新进度
-                self.progress['current'] = min(batch_idx + batch_size, len(stock_codes))
-                self.progress['percentage'] = int((self.progress['current'] / self.progress['total']) * 100)
-                
-                logger.info(f"批次 {batch_num}/{total_batches}: TickFlow 处理 {len(batch_codes)} 只股票 [{self.progress['current']}/{self.progress['total']}] {self.progress['percentage']}%")
-                
-                try:
+
+            batches = [stock_codes[i:i + batch_size] for i in range(0, len(stock_codes), batch_size)]
+            total_batches = len(batches)
+            future_map = {}
+            with ThreadPoolExecutor(max_workers=self.fetch_concurrency) as executor:
+                for bi, batch_codes in enumerate(batches):
+                    future_map[bi] = executor.submit(self._fetch_batch_data, batch_codes, days_to_fetch)
+                for batch_idx, batch_codes in enumerate(batches):
+                    batch_num = batch_idx + 1
+                    # 更新进度
+                    self.progress['current'] = min((batch_idx + 1) * batch_size, len(stock_codes))
+                    self.progress['percentage'] = int((self.progress['current'] / self.progress['total']) * 100)
+                    logger.info(f"批次 {batch_num}/{total_batches}: TickFlow 处理 {len(batch_codes)} 只股票 [{self.progress['current']}/{self.progress['total']}] {self.progress['percentage']}%")
                     batch_start_time = time.time()
-                    batch_result = self._fetch_and_save_batch_concurrent(batch_codes, days_to_fetch)
-                    batch_elapsed = time.time() - batch_start_time
+                    try:
+                        kline_data, api_ok = future_map[batch_idx].result()
+                        batch_result = self._save_batch_data(batch_codes, kline_data, api_ok, days_to_fetch)
+                        batch_elapsed = time.time() - batch_start_time
 
-                    self.stats['added'] += batch_result['added']
-                    self.stats['updated'] += batch_result['updated']
-                    self.stats['failed'] += batch_result['failed']
+                        self.stats['added'] += batch_result['added']
+                        self.stats['updated'] += batch_result['updated']
+                        self.stats['failed'] += batch_result['failed']
 
-                    logger.info(f"批次 {batch_num} 完成: 新增 {batch_result['added']} 条, 失败 {batch_result['failed']} 只, 耗时 {batch_elapsed:.1f}秒")
-
-                except Exception as e:
-                    logger.warning(f"批次 {batch_num} TickFlow 处理失败: {str(e)}")
-                    self.stats['failed'] += len(batch_codes)
+                        logger.info(f"批次 {batch_num} 完成: 新增 {batch_result['added']} 条, 失败 {batch_result['failed']} 只, 耗时 {batch_elapsed:.1f}秒")
+                    except Exception as e:
+                        logger.warning(f"批次 {batch_num} TickFlow 处理失败: {str(e)}")
+                        self.stats['failed'] += len(batch_codes)
             
             # 第3步：检测除权并重建历史数据
             logger.info("=" * 60)
@@ -362,6 +366,55 @@ class KlineUpdater:
             # 默认获取30天
             return 30
     
+    def _fetch_batch_data(self, batch_codes: List[str], days: int) -> tuple:
+        """并发执行：仅拉取该批K线（TickFlow 批量），不保存。返回 (kline_data, api_ok)"""
+        logger.debug(f"TickFlow 批量获取 {len(batch_codes)} 只股票K线 (前复权, {days}天)...")
+        return self.kline_fetcher._fetch_kline_tickflow_batch(batch_codes, days=days)
+
+    def _save_batch_data(self, batch_codes: List[str], kline_data: dict, api_ok: bool, days: int) -> Dict:
+        """主线程串行：TickFlow 失败时降级腾讯逐只 + 批量保存 + 统计"""
+        added = 0
+        updated = 0
+        failed = 0
+
+        if not api_ok:
+            logger.warning(f"TickFlow API 失败，降级到腾讯财经逐只获取 {len(batch_codes)} 只...")
+            for code in batch_codes:
+                if code in kline_data:
+                    continue
+                try:
+                    df = self.stock_data_fetcher.fetch_stock_update(code, days=days)
+                    if df is not None and len(df) > 0:
+                        kline_data[code] = df
+                except Exception as e:
+                    logger.debug(f"腾讯财经降级获取 {code} 失败: {e}")
+            logger.info(f"腾讯财经降级补充: {len(kline_data)}/{len(batch_codes)} 只有数据")
+
+        if kline_data:
+            logger.debug(f"批量保存 {len(kline_data)} 只股票的K线数据...")
+            with self.db_manager.transaction():
+                for stock_code, df_kline in kline_data.items():
+                    if df_kline is not None and len(df_kline) > 0:
+                        try:
+                            batch_added, batch_updated = self._save_kline_records_batch(
+                                stock_code, df_kline, batch_size=100
+                            )
+                            added += batch_added
+                            updated += batch_updated
+                        except Exception as e:
+                            logger.error(f"保存 {stock_code} 数据失败: {str(e)}")
+                            failed += 1
+                    else:
+                        failed += 1
+
+            final_missing = len([c for c in batch_codes if c not in kline_data])
+            failed += final_missing
+        else:
+            failed = len(batch_codes)
+            logger.warning(f"批次 {len(batch_codes)} 只股票全部获取失败")
+
+        return {'added': added, 'updated': updated, 'failed': failed}
+
     def _fetch_and_save_batch_concurrent(self, batch_codes: List[str], days: int) -> Dict:
         """
         【TickFlow 版】使用 TickFlow 批量 API 一次获取一批股票的K线数据并批量保存

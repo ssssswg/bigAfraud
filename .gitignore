@@ -26,5 +26,4 @@ Thumbs.db
 config/config.yaml
 data/backtest_batch/*
 data/risk_cache/*
-config/config.yaml
 config/tushare_config.json

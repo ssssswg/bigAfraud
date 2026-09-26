@@ -92,8 +92,8 @@ class MemoryCache:
         """
         if key in self._cache:
             data, timestamp = self._cache[key]
-            # 检查是否过期
-            if time.time() - timestamp < self._ttl:
+            # 检查是否过期（timestamp 为当日 24:00 时间戳，跨日自动失效）
+            if time.time() < timestamp:
                 return data
             # 过期则删除
             del self._cache[key]
@@ -107,8 +107,11 @@ class MemoryCache:
             key: 缓存键
             value: 缓存值
         """
-        # 存储数据和时间戳
-        self._cache[key] = (value, time.time())
+        # 存储数据，有效期到当日 24:00（跨日自动失效，与 Tushare 每日更新一次的频率对齐）
+        import datetime as _dt
+        tomorrow = _dt.datetime.now() + _dt.timedelta(days=1)
+        end_of_day = tomorrow.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        self._cache[key] = (value, end_of_day)
 
 
 class MoneyflowScorer:
@@ -307,19 +310,22 @@ class MoneyflowScorer:
         ts_code = self._convert_ts_code(stock_code)
 
         try:
-            # 调用 Tushare moneyflow_ths 接口获取实时数据
+            # 按交易日全市场批量拉取 moneyflow_ths 并缓存，同评分日多股共享，
+            # 大幅减少逐股区间查询。
             pro = self._get_pro()
-            df = self._call_tushare_with_retry(
-                pro.moneyflow_ths,
-                ts_code=ts_code,
-                start_date=start_date,
-                end_date=end_date,
-            )
-            # 检查返回数据是否有效
-            if df is not None and not df.empty:
-                logger.debug(
-                    f"获取资金流向数据成功: {stock_code}, {len(df)} 条记录"
-                )
+            from utils.tushare_bulk_cache import daily_bulk
+            frames = []
+            for trade_date in trade_dates:
+                df = daily_bulk.get(pro, 'moneyflow_ths', trade_date)
+                if df is not None and not df.empty and 'ts_code' in df.columns:
+                    sub = df[df['ts_code'] == ts_code]
+                    if not sub.empty:
+                        frames.append(sub)
+            if frames:
+                df = pd.concat(frames, ignore_index=True)
+                if 'trade_date' in df.columns:
+                    df = df.sort_values('trade_date', ascending=False)
+                logger.debug(f"获取资金流向数据成功: {stock_code}, {len(df)} 条记录")
                 # 写入缓存
                 self._cache.set(cache_key, df)
                 return df

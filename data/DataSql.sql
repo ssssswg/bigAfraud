@@ -902,3 +902,23 @@ CREATE TABLE IF NOT EXISTS risk_status (
 CREATE INDEX IF NOT EXISTS idx_risk_status_date ON risk_status(date);
 -- idx_risk_status_date: 日期索引，用于快速查询特定日期的风控状态
 
+
+CREATE TABLE IF NOT EXISTS stock_financial (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    stock_code TEXT NOT NULL,
+    -- stock_code: 股票代码，类型TEXT，必填，例如000001
+    ann_date TEXT,
+    -- ann_date: 公告日期，类型TEXT，可选，格式YYYYMMDD
+    end_date TEXT,
+    -- end_date: 报告期，类型TEXT，可选，格式YYYYMMDD
+    roe REAL,
+    -- roe: 净资产收益率，类型REAL，可选，单位%
+    netprofit_yoy REAL,
+    -- netprofit_yoy: 净利润同比增速，类型REAL，可选，单位%
+    ocfps REAL,
+    -- ocfps: 每股经营现金流，类型REAL，可选
+    eps REAL,
+    -- eps: 每股收益，类型REAL，可选
+    ocf_to_opincome REAL
+    -- ocf_to_opincome: 经营现金流与营业收入比，类型REAL，可选
+);

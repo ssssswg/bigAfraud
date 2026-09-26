@@ -84,6 +84,57 @@ def _get_global_limiter() -> RateLimiter:
     return _LIMITER
 
 
+# 共享 HTTP 会话（连接池复用），降低频繁新建 HTTPS 连接的开销
+_SESSION_POOL = None
+_SESSION_LOCK = threading.Lock()
+
+
+def _get_global_session():
+    global _SESSION_POOL
+    if _SESSION_POOL is None:
+        with _SESSION_LOCK:
+            if _SESSION_POOL is None:
+                import requests
+                _sess = requests.Session()
+                # 不读系统代理/环境代理（trust_env=False），强制直连：
+                # 修复 web 服务启动时系统代理(如 127.0.0.1:7688)被缓存、代理关闭后仍走代理
+                # 导致 Tushare 请求 WinError 10061 的问题（直连已实测可通）。
+                _sess.trust_env = False
+                _SESSION_POOL = _sess
+    return _SESSION_POOL
+
+
+def _inject_session_pool():
+    """
+    将 Tushare 库内部请求改用共享 Session（连接池复用），幂等。
+
+    Tushare pro client 每次调用都执行模块级 requests.post，无连接复用。
+    此处仅替换 tushare.pro.client 模块内绑定的 requests 引用，隔离在该库内部，
+    不影响项目其他代码。失败时仅告警、不影响功能。
+    """
+    try:
+        from tushare.pro import client as _tclient
+        if getattr(_tclient, '_session_injected', False):
+            return _get_global_session()
+        _real = _tclient.requests
+        _session = _get_global_session()
+
+        class _SessionRequests:
+            """仅将 post 转发到共享 Session，其余属性透传真实 requests 模块。"""
+            def post(self, *a, **k):
+                return _session.post(*a, **k)
+            def __getattr__(self, name):
+                return getattr(_real, name)
+
+        _tclient.requests = _SessionRequests()
+        _tclient._session_injected = True
+        logger.debug("已为 Tushare 启用连接池复用")
+        return _session
+    except Exception as e:
+        logger.warning(f"注入 Tushare 连接池失败（不影响功能）: {e}")
+        return None
+
+
 def _load_token() -> str:
     """从 config/tushare_config.json 读取 token"""
     try:
@@ -116,6 +167,8 @@ def get_pro(token: str = None):
         # 规范要求必须设置这两行（见 config/tushare.md）
         pro._DataApi__token = tk
         pro._DataApi__http_url = TUSHARE_HTTP_URL
+        # 启用连接池复用（幂等）
+        _inject_session_pool()
         # 返回限流代理，全局统一限速
         return _ThrottledPro(pro, _get_global_limiter())
     except Exception as e:

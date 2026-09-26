@@ -7,16 +7,22 @@
 
 from utils.tushare_client import get_pro
 import logging
+import threading
 from datetime import datetime, timedelta
 from typing import List, Optional
 
 # 配置日志记录器
 logger = logging.getLogger(__name__)
 
+# ---- 交易日历进程内缓存（交易日历为低频数据，按区间缓存即可） ----
+_cal_lock = threading.RLock()
+_is_trading_cache = {}      # {YYYYMMDD: bool}
+_days_range_cache = {}      # {(start, end): List[str]}
+
 
 def is_trading_day(date_str: str) -> bool:
     """
-    判断指定日期是否为交易日
+    判断指定日期是否为交易日（带进程内缓存）
 
     优先使用 Tushare 获取真实交易日历，包含节假日判断。
     如果 Tushare 不可用，则回退到简单的周末排除逻辑。
@@ -26,6 +32,17 @@ def is_trading_day(date_str: str) -> bool:
     返回:
         bool: 是否为交易日
     """
+    norm = str(date_str).replace('-', '')
+    with _cal_lock:
+        if norm in _is_trading_cache:
+            return _is_trading_cache[norm]
+    result = _is_trading_day_impl(date_str)
+    with _cal_lock:
+        _is_trading_cache[norm] = result
+    return result
+
+
+def _is_trading_day_impl(date_str: str) -> bool:
     try:
         # 统一日期格式
         if '-' in date_str:
@@ -103,6 +120,12 @@ def get_trading_days(start_date: str, end_date: str) -> List[str]:
         else:
             end_str = end_date
 
+        # 进程内缓存：同一区间不重复请求
+        cache_key = (start_str, end_str)
+        with _cal_lock:
+            if cache_key in _days_range_cache:
+                return list(_days_range_cache[cache_key])
+
         # 尝试使用 Tushare 批量获取交易日历
         try:
             import tushare as ts
@@ -133,6 +156,8 @@ def get_trading_days(start_date: str, end_date: str) -> List[str]:
                     for _, row in df.iterrows()
                 ]
                 logger.info(f"批量获取到 {len(trading_days)} 个交易日")
+                with _cal_lock:
+                    _days_range_cache[cache_key] = list(trading_days)
                 return trading_days
 
         except Exception as e:
@@ -151,6 +176,8 @@ def get_trading_days(start_date: str, end_date: str) -> List[str]:
             current += timedelta(days=1)
 
         logger.info(f"获取到 {len(trading_days)} 个交易日（降级模式）")
+        with _cal_lock:
+            _days_range_cache[cache_key] = list(trading_days)
         return trading_days
 
     except Exception as e:
