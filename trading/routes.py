@@ -1719,9 +1719,13 @@ def khunter_save():
         hunting_date = data.get('hunting_date')
         tracking_days = data.get('tracking_days', 10)
         timing_strategy = data.get('timing_strategy', 'support')
+        # 前端计算好的结果（可选）：传入则直接保存，保证所见即所得
+        results = data.get('results')
+        if results is not None and not isinstance(results, list):
+            results = None  # 非法类型不传，走强制重算
         
         # 2. 调用 API 保存
-        result = khunter_api.save(hunting_date, tracking_days, timing_strategy)
+        result = khunter_api.save(hunting_date, tracking_days, timing_strategy, results=results)
         
         # 3. 返回结果
         return jsonify(result), 200 if result.get('success') else 400

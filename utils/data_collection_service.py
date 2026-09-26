@@ -354,15 +354,35 @@ class DataCollectionService:
                 self._add_init_log("✓ 全量初始化完成")
                 self._update_progress(100)
                 
+                self.init_status['progress'] = 100
+                self.init_status['message'] = '初始化完成'
+                # 先计算统计信息，再置 completed，确保任何 completed 响应都携带统计
+                self.init_status['statistics'] = self.get_tables_stats()
+                self.init_status['success'] = 1
                 self.init_status['status'] = 'completed'
                 self.init_status['end_time'] = datetime.now().isoformat()
                 self._add_init_log("✓ 重新初始化全部完成")
+
+                # 推送完成状态
+                try:
+                    from web_server import emit_init_progress
+                    emit_init_progress()
+                except ImportError:
+                    pass
                 
             except Exception as e:
                 self.init_status['status'] = 'failed'
                 self.init_status['end_time'] = datetime.now().isoformat()
                 self._add_init_log(f"✗ 重新初始化失败: {str(e)}")
                 logger.error(f"重新初始化失败: {e}")
+            finally:
+                self.init_status['running'] = False
+                # 推送最终状态（含统计/失败）
+                try:
+                    from web_server import emit_init_progress
+                    emit_init_progress()
+                except ImportError:
+                    pass
     
     def _delete_all_data(self):
         """删除所有数据表内容"""

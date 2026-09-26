@@ -61,3 +61,37 @@
 - **优化**（`utils/kline_updater.py`）：原主循环**逐批串行**（54 批排队）→ **ThreadPoolExecutor 并发拉批（默认 3 路）+ 主线程串行保存**（不争 DB 写锁）。新增 `_fetch_batch_data`（并发拉取）/ `_save_batch_data`（保存 + 腾讯降级），保留原方法备用。
 - **预期**：约 22 分钟 → 8~11 分钟；TickFlow 服务端恢复后（6s/批）可回到 5 分钟内。
 - **验证**：编译通过；monkeypatch 模拟每批 1.5s、2 批：全程 3.03s（就绪检查 1.5s + 2 批并发 1.5s，串行应 4.5s），保存链路正常（added=6）。
+### 修复：重新初始化结果统计缺失（成功/失败/总数显示 0）
+- **现象**：数据管理-初始化数据 走"重新初始化"（REINIT）后显示"初始化成功！"，但成功数量/失败数量/总数量均为 0。
+- **根因**：`data_collection_service._run_reinit`（重新初始化专用路径）完成块**缺少 `statistics` 统计、`success=1`、`running=False` 复位**（对比 `_run_initialization` 有完整完成块 + finally），前端 `data.statistics` 为空 → 三块全 0，且完成后 running 仍为 true。
+- **修复**：`_run_reinit` 完成块补齐 `statistics = get_tables_stats()`、`success=1`、`progress=100`、`message`；新增 `finally` 复位 `running=False`；完成/失败均推送最终状态。
+- **验证**：模拟 `_run_reinit` 完成态完整（status=completed、running=False、statistics.success=5400/stock_kline=3927687）；编译通过。需重启服务生效。
+
+### 修复：基础数据页部分股票最新价显示 0 / 数据条数 0（K线缺失）
+- **现象**：数据管理-基础数据页 平安银行（000001）最新价 ¥0、数据条数 0（万科A 正常）。用户怀疑"更新出问题"。
+- **排查链**（日志 + 数据库 + 代码 + 复现实验逐层钉死）：
+  1. 数据库实测：**75 只股票 K线=0**（`stock_basic` 有记录但 `stock_kline` 无任何行）；表结构确认 `stock_basic.code` / `stock_kline.code` 才是股票代码列（无串写）；实时拉数验证 000001/000156/000338 价格一致，**排除 symbol↔code 串写**。
+  2. 日志解析（22:43 全量初始化 53 批次）：事务日志逐批"开始→提交成功"，无回滚/锁定；"命中 100/100"、无保存失败。
+  3. **两类缺失**：**15 只不在任何批次 URL**（`000991/001235/001246/002257/002525/002720/300060/300361/300728/301660/301716/600349/603302/603361/688688`，即 00:33 new_stock_detector 报告的"新股票"）；**60 只在批次 URL 中却未入库**（集中 22:47-22:50）。
+  4. **15 只真相**：名称即铁证——"无效里得""无效恒久"（名称带"无效"）、"蚂蚁集团 688688"（从未上市）、"奥赛康/浙江国祥/胜景山河/立立电子"等均为**历史上 IPO 被否/撤单的申购残留代码**；经 **Tushare（5569 上市+340 退市）与 baostock 双重核验不存在** → **akshare 降级源（东财接口）混入无效申购代码**，写入 stock_basic 后永远无 K线。
+  5. **60 只真相**：当前磁盘代码复现实验（临时库 + 真实 TickFlow 拉 100 只含缺失样本）**100/100 全部入库**；同时复现 TickFlow 100 只批次响应体在 **~4.4MB 处被截断**导致 JSON 解析失败（重试后成功）→ 22:43 那轮为**网络/响应瞬态导致部分批次数据缺失**（非当前代码保存逻辑缺陷）。
+- **修复**：
+  1. **数据修复**：60 只缺失股票已补拉入库（000001 恢复 750 条、最新 2026-09-24）；15 只无效代码已从 `stock_basic` 删除（无任何关联数据，删除安全）。
+  2. **代码根治（黑名单）**：`utils/stock_data_fetcher.py` `get_all_stock_codes` 新增 `invalid_codes` 黑名单（15 只核验不存在的申购残留代码），Tushare/腾讯/akshare 三个源统一过滤；akshare 分支排除关键词增加"无效"。验证：get_all_stock_codes 返回 5203 只、无假代码残留。
+  3. **自动补拉兜底**：`utils/data_initializer.py` `_init_kline_history_data` 保存失败日志 DEBUG→WARNING；记录 `saved_codes` 集合；**初始化完成后校验请求过的股票是否全部入库，缺失自动补拉**（TickFlow→腾讯降级，最多 1 轮），仍缺失仅 WARNING 不计入中断。
+- **验证**：编译通过；冒烟测试（临时库 + 20 只真实拉取）20/20 入库无缺失；库内假代码清零。**黑名单与自动补拉需重启服务生效，数据修复已即时生效**。
+
+### 修复：狩猎场保存结果与页面计算不一致（保存了旧缓存记录）
+- **现象**：狩猎场计算显示 2 只（如 000411/002238），点"保存"提示"已保存 1 条记录"，且狩猎跟踪里查到的不是页面显示的那 2 只。
+- **排查链**：
+  1. 日志证据：保存请求 `timing_strategy=turtle`，但页面下拉框显示"顺势宝"（value=`macd_bollinger`）→ **计算与保存参数不一致**。
+  2. 前端根因：`index.html` 存在**两个重复 id 的 `#timing-strategy` 下拉框**（其他页面 1119 行 + 狩猎场页 1696 行）。`calculate()` 用 `querySelector('#khunter-page #timing-strategy')`（读到 macd_bollinger），`saveResults()` 用 `getElementById('timing-strategy')`（读到**第一个**=turtle）→ 保存时传了 turtle。
+  3. 后端根因：`KHunterAPI.save()` 内部**重新调用 `process()`**，而 `process()` 的缓存 `_check_cache` 以 **khunter 表已存记录为缓存**（`WHERE hunting_date=? AND timing_strategy=?`）→ 命中了**昨天（09-25 16:16）保存的 (2026-09-24, turtle) 旧记录 600000** → 保存了旧缓存而非用户当前计算的结果。
+- **修复**：
+  1. 前端 `saveResults()`：选择器改为 `#khunter-page #timing-strategy`（与计算一致）；**把当前计算结果 `currentResults` 一并传给保存接口**（所见即所得）。
+  2. 后端 `KHunterAPI.save()`：新增 `results` 参数——**传入结果则直接保存**（不再走 process 命中缓存）；**未传结果则 `force_refresh=True` 强制重算**后再保存。
+  3. `KHunterDataProcessor.process()`：新增 `force_refresh` 参数，为 True 时跳过 `_check_cache` 强制重新计算。
+  4. `routes.khunter_save()`：接收并透传前端 `results` 字段（非列表时忽略，走强制重算）。
+- **验证**：编译通过；mock 验证 save 两条路径——传 results 时 process 调用 0 次、直接保存 2 条；不传时 process 被调用且 `force_refresh=True`；`force_refresh` 跳过缓存逻辑存在；前端 JS 语法检查通过。**需重启服务 + 刷新浏览器生效**。
+- **说明**：历史旧记录（如 600000/turtle）为用户此前保存的数据，予以保留；修复后重新保存会新增正确的 macd_bollinger 结果。
+

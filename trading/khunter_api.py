@@ -6,7 +6,7 @@ KHunter API 模块
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import List, Dict, Any, Optional
 from datetime import datetime
 
 # 配置日志
@@ -99,7 +99,8 @@ class KHunterAPI:
         self,
         hunting_date: str,
         tracking_days: int = DEFAULT_TRACKING_DAYS,
-        timing_strategy: str = 'support'
+        timing_strategy: str = 'support',
+        results: Optional[List[Dict[str, Any]]] = None
     ) -> Dict[str, Any]:
         """
         保存计算结果
@@ -108,6 +109,8 @@ class KHunterAPI:
             hunting_date: 狩猎日期
             tracking_days: 跟踪天数
             timing_strategy: 择时策略名称，默认support
+            results: 前端计算好的结果列表（可选）。传入时直接保存（所见即所得），
+                     避免后端重新走缓存命中旧记录；不传时强制重算后再保存。
         
         返回：
             Dict: 标准化响应
@@ -115,18 +118,24 @@ class KHunterAPI:
         # hunting_date: 狩猎日期，类型str，必填
         # tracking_days: 跟踪天数，类型int，默认10
         # timing_strategy: 择时策略名称，类型str，默认support
+        # results: 前端计算结果列表，类型List[Dict]，可选
         try:
             # 1. 验证参数
             self._validate_date(hunting_date)
             self._validate_tracking_days(tracking_days)
             self._validate_timing_strategy(timing_strategy)
             
-            # 2. 先计算数据
-            logger.info(f"保存请求: {hunting_date} {tracking_days} timing_strategy={timing_strategy}")
-            result = self.data_processor.process(hunting_date, tracking_days, timing_strategy)
-            
-            # 3. 保存结果到数据库
-            saved_count = self.dao.save_batch_results(result['results'])
+            if results is not None:
+                # 2a. 前端传入计算结果，直接保存（保存用户当前看到的，而非旧缓存）
+                logger.info(f"保存请求(直接保存前端结果): {hunting_date} {len(results)} 条")
+                saved_count = self.dao.save_batch_results(results)
+            else:
+                # 2b. 未传结果：强制重新计算（跳过缓存）再保存
+                logger.info(f"保存请求: {hunting_date} {tracking_days} timing_strategy={timing_strategy}")
+                result = self.data_processor.process(
+                    hunting_date, tracking_days, timing_strategy, force_refresh=True
+                )
+                saved_count = self.dao.save_batch_results(result['results'])
             
             # 4. 返回成功响应
             response_data = {

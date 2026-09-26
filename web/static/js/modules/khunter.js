@@ -541,16 +541,16 @@ function updateStats(data) {
  * 保存计算结果
  */
 function saveResults() {
-    // 1. 获取参数
+    // 1. 获取参数（限定狩猎场页面内选择器，避免与页面其他重复 id 冲突）
     const huntingDate = document.getElementById('hunting-date').value;
     const trackingDays = parseInt(document.getElementById('tracking-days').value);
-    const timingStrategy = document.getElementById('timing-strategy').value;
+    const timingStrategy = document.querySelector('#khunter-page #timing-strategy').value;
     
     // 2. 显示加载状态
     showLoading(true);
     disableControls(true);
     
-    // 3. 调用保存 API
+    // 3. 调用保存 API（把当前计算结果一并传给后端，保证保存的就是页面上看到的）
     fetch('/api/khunter/save', {
         method: 'POST',
         headers: {
@@ -559,7 +559,8 @@ function saveResults() {
         body: JSON.stringify({
             hunting_date: huntingDate,
             tracking_days: trackingDays,
-            timing_strategy: timingStrategy
+            timing_strategy: timingStrategy,
+            results: currentResults || []
         })
     })
     .then(response => response.json())
@@ -684,7 +685,7 @@ function showLoading(show) {
 function disableControls(disable) {
     document.getElementById('hunting-date').disabled = disable;
     document.getElementById('tracking-days').disabled = disable;
-    document.getElementById('timing-strategy').disabled = disable;
+    document.querySelector('#khunter-page #timing-strategy').disabled = disable;
     document.getElementById('calculate-btn').disabled = disable;
     document.getElementById('save-btn').disabled = disable;
 }

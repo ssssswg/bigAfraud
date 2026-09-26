@@ -142,6 +142,8 @@ class DataInitializer:
         success_count = 0
         failed_count = 0
         total_inserted = 0
+        # 成功入库的股票代码集合（用于完成后校验缺失并自动补拉）
+        saved_codes = set()
         # fallback_mode: 是否已降级到腾讯财经
         fallback_mode = False
         # 连续 TickFlow 失败计数（用于判断是否永久降级）
@@ -313,10 +315,11 @@ class DataInitializer:
                             cursor.executemany(insert_sql, records)
                             batch_inserted += len(records)
                             success_count += 1
+                            saved_codes.add(code)
 
                         except Exception as e:
                             failed_count += 1
-                            logger.debug(f"批量保存 {code} K线失败: {e}")
+                            logger.warning(f"批量保存 {code} K线失败: {e}")
 
                 # ============ 步骤3: 统计与进度 ============
                 # 统计批次中本批无数据的股票数（不在 kline_dict 即为最终失败）
@@ -361,6 +364,58 @@ class DataInitializer:
                         time_module.sleep(backoff)
                     else:
                         consecutive_empty_tencent = 0
+
+            # ============ 缺失校验与自动补拉（防网络瞬态丢批）============
+            # 请求过的股票中仍有未入库的，自动补拉（TickFlow 优先，失败降级腾讯）
+            missing_after = [c for c in stock_codes if c not in saved_codes]
+            if missing_after:
+                logger.warning(
+                    f"K线初始化后检测到 {len(missing_after)} 只股票未入库，开始自动补拉: "
+                    f"{missing_after[:10]}{'...' if len(missing_after) > 10 else ''}"
+                )
+                for i in range(0, len(missing_after), batch_size):
+                    batch = missing_after[i:i + batch_size]
+                    kline_dict2, ok2 = self.stock_data_fetcher._fetch_stock_batch_tickflow(
+                        batch, days=days
+                    )
+                    if not ok2:
+                        logger.warning(f"补拉批次 TickFlow 失败，降级腾讯财经...")
+                        kline_dict2 = self.stock_data_fetcher._fetch_stock_batch_tencent(
+                            batch, years=years, concurrency=2
+                        )
+                    with self.db_manager.transaction():
+                        conn = self.db_manager.connect()
+                        cursor = conn.cursor()
+                        for code, df_kline in kline_dict2.items():
+                            if df_kline is None or len(df_kline) == 0:
+                                continue
+                            try:
+                                from utils.date_utils import normalize_date
+                                dates = df_kline['date'].apply(
+                                    lambda x: normalize_date(x) if x is not None else None)
+                                volumes = df_kline['volume'].fillna(0).astype(int)
+                                opens = df_kline['open'].astype(float)
+                                highs = df_kline['high'].astype(float)
+                                lows = df_kline['low'].astype(float)
+                                closes = df_kline['close'].astype(float)
+                                records = list(zip(
+                                    [code] * len(df_kline), dates, opens, highs, lows,
+                                    closes, volumes
+                                ))
+                                cursor.executemany(insert_sql, records)
+                                success_count += 1
+                                saved_codes.add(code)
+                            except Exception as e:
+                                logger.warning(f"补拉保存 {code} K线失败: {e}")
+                    time_module.sleep(2)
+                still_missing = [c for c in missing_after if c not in saved_codes]
+                if still_missing:
+                    logger.warning(
+                        f"补拉后仍有 {len(still_missing)} 只股票无K线数据(可能为无效/停牌): "
+                        f"{still_missing[:20]}{'...' if len(still_missing) > 20 else ''}"
+                    )
+                else:
+                    logger.info(f"补拉完成: 全部 {len(missing_after)} 只已入库")
 
             # 计算最终失败数
             final_failed = total - success_count

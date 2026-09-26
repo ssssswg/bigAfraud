@@ -48,7 +48,8 @@ class KHunterDataProcessor:
         self,
         hunting_date: str,
         tracking_days: int = DEFAULT_TRACKING_DAYS,
-        timing_strategy: str = 'support'
+        timing_strategy: str = 'support',
+        force_refresh: bool = False
     ) -> Dict[str, Any]:
         """
         处理狩猎场数据
@@ -99,8 +100,10 @@ class KHunterDataProcessor:
             actual_hunting_date = self._determine_hunting_date(hunting_date)
             logger.info(f"确定狩猎日期: {hunting_date} -> {actual_hunting_date}")
             
-            # 2. 检查缓存（按timing_strategy过滤）
-            cached_results = self._check_cache(actual_hunting_date, timing_strategy)
+            # 2. 检查缓存（按timing_strategy过滤）；force_refresh 时跳过缓存强制重算
+            if force_refresh:
+                logger.info(f"强制刷新模式：跳过缓存，重新计算 {actual_hunting_date} {timing_strategy}")
+            cached_results = None if force_refresh else self._check_cache(actual_hunting_date, timing_strategy)
             if cached_results is not None:
                 calculation_time = time.time() - start_time
                 logger.info(f"从缓存加载结果: {len(cached_results)} 条记录，耗时 {calculation_time:.2f}s")

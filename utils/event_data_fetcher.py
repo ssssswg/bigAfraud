@@ -52,12 +52,17 @@ class EventDataFetcher:
                    'trade_date,ts_code,exalter,side,buy,sell,net_buy,reason'),
     }
 
+    # 已知镜像不支持的接口（已探测确认），默认禁用，避免每次初始化重复探测并刷警告；
+    # 若镜像后续支持，从该集合移除对应接口名即可自动恢复
+    KNOWN_UNAVAILABLE: set = {'stk_seasoned'}
+
     def __init__(self, db_manager):
         self.db_manager = db_manager
         self._pro = None
         self.stats = {'added': 0, 'updated': 0, 'failed': 0}
         # 探测确认不可用的接口（如镜像不支持的 stk_seasoned），避免每次报错
-        self._disabled = set()
+        # 初始即禁用已知不可用接口；运行时探测到其他不可用接口再动态加入
+        self._disabled = set(self.KNOWN_UNAVAILABLE)
 
     def _get_pro(self):
         if self._pro is None:

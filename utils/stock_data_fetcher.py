@@ -316,7 +316,19 @@ class StockDataFetcher:
             股票代码到名称的映射字典
         """
         logger.info("正在获取A股股票列表...")
-        
+
+        # 无效股票代码黑名单：经 Tushare(5569上市+340退市)/baostock 核验不存在的
+        # 申购残留/无效代码（如“蚂蚁集团688688”从未上市，“无效恒久300060”等），
+        # 在降级到腾讯/akshare 源时必须过滤，防止写入 stock_basic 后永远无K线。
+        invalid_codes = {
+            '000991', '001235', '001246', '002257', '002525', '002720',
+            '300060', '300361', '300728', '301660', '301716',
+            '600349', '603302', '603361', '688688',
+        }
+
+        def _filter_invalid(stock_dict):
+            return {k: v for k, v in stock_dict.items() if k not in invalid_codes}
+
         # 方法1: 优先使用 Tushare 获取完整股票列表
         for attempt in range(max_retries):
             try:
@@ -370,6 +382,7 @@ class StockDataFetcher:
                         
                         if stock_dict:
                             logger.info(f"✓ Tushare 获取成功: {len(stock_dict)} 只A股股票")
+                            stock_dict = _filter_invalid(stock_dict)
                             self._save_stock_names(stock_dict)
                             return stock_dict
             
@@ -398,6 +411,7 @@ class StockDataFetcher:
                     
                     if filtered:
                         logger.info(f"✓ 腾讯接口获取成功: {len(filtered)} 只A股股票")
+                        filtered = _filter_invalid(filtered)
                         self._save_stock_names(filtered)
                         return filtered
             except Exception as e:
@@ -418,11 +432,12 @@ class StockDataFetcher:
                 code_pattern = r'^(00|30|60|68|88)\d{4}$'
                 all_stocks = all_stocks[all_stocks['代码'].str.match(code_pattern)]
                 
-                exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC']
+                exclude_keywords = ['债', '基', 'ETF', 'LOF', '基金', '理财', '信托', 'B股', '指数', '国债', '企债', '转债', '回购', 'R-', 'GC', '无效']
                 for keyword in exclude_keywords:
                     all_stocks = all_stocks[~all_stocks['名称'].str.contains(keyword, na=False)]
                 
                 stock_dict = dict(zip(all_stocks['代码'], all_stocks['名称']))
+                stock_dict = _filter_invalid(stock_dict)
                 logger.info(f"✓ akshare 获取成功: {len(stock_dict)} 只A股股票")
                 self._save_stock_names(stock_dict)
                 return stock_dict
