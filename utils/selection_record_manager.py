@@ -138,14 +138,12 @@ class SelectionRecordManager:
             selection_date = None
             
             if end_date:
-                # 用户选择了日期，先检查该日期是否有K线数据
+                # 按执行选股的自然日归档（不做交易日映射，周末/节假日保存当天日期，
+                # 便于历史选股按执行当天查询）
                 try:
                     user_date = datetime.strptime(end_date, '%Y-%m-%d').date()
-                    selection_date = self._get_nearest_kline_date(user_date)
-                    if selection_date:
-                        logger.info(f"用户选择日期: {user_date}，使用最近的交易日: {selection_date}")
-                    else:
-                        logger.warning(f"用户选择日期 {user_date} 及之前没有K线数据")
+                    selection_date = user_date
+                    logger.info(f"选股保存日期(自然日): {user_date}")
                 except Exception as e:
                     logger.warning(f"解析用户选择日期失败: {str(e)}")
             

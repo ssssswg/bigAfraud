@@ -154,3 +154,9 @@
 - **验证**：模拟 `cleaned_results`（5 只、3 只多策略共振）输出正确——共振置顶 301213（回马枪+W底）/603997（W底+趋势加速）/301136（2560+多金叉），各策略合并一行，买入去重后只跑 5 次 analyze。`web_server.py` 编译通过，**需重启服务生效**。
 
 - **钉钉推送补全**：项目此前**只有配置（config.yaml 钉钉 webhook/secret）、无任何发送实现**（无 DingTalkNotifier，web_server 只推飞书）→ 新增 `utils/dingtalk_notifier.py`（DingTalkNotifier，含**加签** HMAC-SHA256：timestamp+secret → base64 → `&timestamp=&sign=`），web_server 推送段在飞书后并列推钉钉（未配置时静默跳过）。验证：加签 URL 正确含 timestamp/sign，payload msgtype=text 正确；编译通过。**需重启服务生效**。追加：**钉钉推送增加开关**——`config.yaml` 的 `dingtalk.enabled`（默认 true）；web_server 钉钉段先判断 `enabled`，为 false 时跳过（log "钉钉推送已关闭"），config.yaml.template 同步。验证：config.yaml 读取 enabled=True；编译通过。**需重启服务生效**。**飞书推送同步加开关**——`config.yaml` 的 `feishu.enabled`（默认 true），template 补 feishu 段；web_server 飞书发送段先判断 `enabled`，为 false 时跳过。验证：config.yaml 读取 feishu.enabled=True、dingtalk.enabled=True；编译通过。**需重启服务生效**。
+
+### 修复：历史选股按自然日归档（周末/节假日执行选股当天能查到）
+- **现象**：09-27（周日）执行选股 17 只并"保存结果"，但历史选股按 09-26~09-27 查询为空。
+- **排查**：保存日志显示"保存:0 更新:17 错误:0"（**保存成功**），但数据库记录 `selection_date=2026-09-24`（selection_time=09-27 17:55:09）——`save_selection` 的 `_get_nearest_kline_date` 把执行日 09-27 映射到最近交易日 **09-24**（因周末），记录归档到 09-24，历史选股按 09-26~27 查不到。
+- **修复**：`utils/selection_record_manager.py` 保存选股时改为**按执行选股的自然日归档**（`selection_date = user_date`，不做交易日映射；周末/节假日保存当天日期），`selection_time` 仍记录真实执行时间。历史选股按执行当天即可查询。
+- **验证**：改后 end_date=2026-09-27 -> selection_date=2026-09-27（不再映射 09-24）；日期段不再调用 `_get_nearest_kline_date`。编译通过，**需重启服务生效**；重新执行选股并保存后，当天结果将落在执行日。
