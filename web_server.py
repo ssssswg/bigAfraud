@@ -439,7 +439,7 @@ def get_hot_areas():
         
         # 获取top50股票
         rows = db_manager.query("""
-            SELECT sector
+            SELECT sector, industry
             FROM stock_selection_record
             WHERE selection_date = ?
             ORDER BY rank_position ASC
@@ -457,7 +457,7 @@ def get_hot_areas():
         # 统计板块分布
         area_count = {}
         for row in rows:
-            area = row['sector'] or '未知'
+            area = row['sector'] or row['industry'] or '未知'
             if area in area_count:
                 area_count[area] += 1
             else:

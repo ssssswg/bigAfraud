@@ -315,6 +315,16 @@ class RankingManager:
             else:
                 logger.debug(f"没有找到板块详情记录")
             
+            # 板块评分未产出时，用 stock_basic.industry 兜底，避免板块显示"未知"
+            try:
+                ind_rows = self.db_manager.query(
+                    "SELECT industry FROM stock_basic WHERE code = ?", (stock_code,))
+                if ind_rows and ind_rows[0] and ind_rows[0]['industry']:
+                    logger.debug(f"板块评分未产出，用行业兜底: {stock_code} -> {ind_rows[0]['industry']}")
+                    return ind_rows[0]['industry']
+            except Exception as ind_e:
+                logger.debug(f"行业兜底失败 {stock_code}: {ind_e}")
+
             logger.debug(f"无法获取股票 {stock_code} 的板块信息")
             return ''
         except Exception as e:
