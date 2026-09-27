@@ -28,19 +28,14 @@
 
 ### 接入修复
 - **配置文件编码（gbk → utf-8）**：4 个评分器与 `trade_date_utils` 读取 `config/tushare_config.json` 统一 `encoding='utf-8'`（Windows 默认 gbk 解码含中文注释的 UTF-8 文件失败 → token 加载失败、交易日回退周末判断）。修复后资金面/板块评分恢复、交易日按真实日历判断。
-- **市值数据错乱**：`get_stock_market_cap` 调 `daily_basic` 未带 `trade_date`，镜像返回多日历史多行市值。改为显式传入最新交易日（`trade_date_utils.get_previous_trading_day`）。验证：全市场市值正确（000001 = 2192.87 亿元）。
+- **市值数据错乱**：`get_stock_market_cap` 调 `daily_basic` 未带 `trade_date`，镜像返回多日历史多行市值。改为显式传入最新交易日（`trade_date_utils.get_previous_trading_day`）。验证：全市场市值正确（示例股 = 2192.87 亿元）。
 - **龙头策略涨停池取数**：`scripts/collect_limit_up_pool.py` 自定义 `def get_pro()`（0 参数）同名覆盖统一客户端 → `get_pro(token)` 报参数错误。删除冗余定义，统一走 `utils.tushare_client.get_pro`。验证：`fetch_limit_up_day(pro,'20260924')` 返回 52 只涨停股。
 - **回测股票池移除配置**：`config/pool_removal_config.yaml` 补齐 5 个新策略（含类名 + 中文名双 key），修复"策略 主升低吸策略 未配置股票池移除参数"。验证：类名与中文名均命中。
 
 ### 性能优化：回测缓存加速
-- **背景**：回测评分逐股票实时调 Tushare，实测 19.4 分钟仅完成 119 只（~9.8 秒/只）、2067 次 POST（每只约 17 次往返、无连接复用）。
-- **修复 4 项**：
-  1. **按交易日全市场批量缓存**（新增 `utils/tushare_bulk_cache.py`）：top_list / block_trade / stk_shock / moneyflow_ths 改为按 `trade_date` 拉全市场缓存，同评分日多股共享（top_list 618→每日 1 次、moneyflow_ths 272→每日 1 次）；
-  2. **交易日历全局缓存**（`utils/trade_date_utils.py`）：`is_trading_day`/`get_trading_days` 加进程内缓存（trade_cal 216→少量）；
-  3. **HTTPS 连接复用**（`utils/tushare_client.py`）：`_inject_session_pool` 将 tushare 内部 `requests.post` 替换为共享 Session（连接池），隔离在该库内部、幂等；
-  4. **低频接口**（fina_indicator 等）保留现有 `self._cache`。
-- **时效保证**：缓存以交易日为失效单位——同交易日首次拉取后复用、跨日 key 变化自动重拉（Tushare 每日更新一次）；`daily_bulk.invalidate` 可强制刷新。评分器 `MemoryCache` 由 5 分钟 TTL 改为**当日 24:00 自然日失效**。
-- **验证**：编译通过；mock 确认同交易日只拉 1 次、跨日自动重拉、连接池注入幂等。
+- **背景**：回测评分逐股票实时调 Tushare（无连接复用），实测 19.4 分钟仅完成 119 只（~9.8 秒/只、2067 次 POST）。
+- **修复 4 项**：① **按交易日全市场批量缓存**（新增 `utils/tushare_bulk_cache.py`）：top_list / block_trade / stk_shock / moneyflow_ths 按 `trade_date` 拉全市场缓存，同评分日多股共享（原每只多次 POST → 每日 1 次）；② **交易日历全局缓存**（`trade_date_utils`，trade_cal 216→少量）；③ **HTTPS 连接复用**（`tushare_client._inject_session_pool` 共享 Session 连接池，幂等）；④ 低频接口保留现有缓存。
+- **时效保证**：缓存以交易日为失效单位——同交易日首次拉取后复用、跨日自动重拉（Tushare 每日更新一次）；评分器缓存由 5 分钟 TTL 改为**当日 24:00 自然日失效**。
 
 ### 修复（连接池复用的副作用闭环）
 - **Tushare 代理连接失败**：共享 Session（持久对象，`trust_env` 默认读系统/环境代理）在服务启动时捕获系统代理 `127.0.0.1:7688`，代理软件关闭后进程仍走该代理 → 全部外呼 `WinError 10061`。修复：共享 Session 设 `trust_env=False` 强制直连（直连 tuaremax.top 实测 200）。**需重启 web 服务生效**；若必须走代理访问则需保持代理软件运行。
@@ -54,7 +49,7 @@
 - **事件 9 接口入库**（新增 `utils/event_data_fetcher.py`）：forecast / express / repurchase / stk_holdernumber / stk_holdertrade / share_float / stk_seasoned / top_list / top_inst（doc_id 45/46/124/166/175/160/494/106/107）按公告日/交易日单日全市场拉取写 `stock_event`；不支持的接口（stk_seasoned）探测后自动禁用；按 (event_type, event_date) 先删后插幂等；`_init_event_data` 全量拉近 90 天、**增量只拉最新日期之后**。
 - **事件应用到评分**（`event_scorer`）：`_query_local_events` 读库优先（forecast / 股东增减持 / 股票回购），新增 4 个 `_check_*`（限售解禁 -10、股东户数环比 ±10、龙虎榜机构 ±10、业绩快报 ±8/15），扩展 `EVENT_VALIDITY`/`POSITIVE_SCORES`/`NEGATIVE_SCORES`/`LOCAL_EVENT_TYPES`；清理读库优先重复注入。
 - **基本面财务本地化**（新增 `utils/financial_data_fetcher.py`）：`fina_indicator` 镜像**仅接受 ts_code**（不支持 period 批量）→ `fetch_all_stocks()` 逐股入库 `stock_financial`、增量 `fetch_for_stock`；`fundamental_scorer._fetch_fina_indicator` 读库优先。`_init_financial_data` 改为**后台线程（daemon）**执行，主流程立即返回。
-- **验证**：单日事件入库 1296 条；评分读库命中时 Tushare `_pro` 不触发（holdertrade/repurchase/forecast + 4 新事件）；000001 入库 8 期财务、读库评分 80；综合评分冒烟 5 维度正常（000001=46.1、000504 资金面一票否决=-100）；重复跑幂等。
+- **验证**：单日事件入库 1296 条；评分读库命中时 Tushare `_pro` 不触发（holdertrade/repurchase/forecast + 4 新事件）；示例股入库 8 期财务、读库评分 80；综合评分冒烟 5 维度正常（示例股=46.1、另一股资金面一票否决=-100）；重复跑幂等。
 
 ### 性能优化：K线更新并发拉批
 - **背景**：09-26 数据更新（K线 5400 只）变慢。量化对比（同参数 count=60/批~100 只）：09-25 请求间隔 **p50=6 秒/批** → 09-26 **p50=25 秒/批**，慢约 4 倍。根因：**TickFlow 免费 API 服务端响应变慢/限流**（外部因素，非代码/代理/数据量）。
@@ -68,68 +63,46 @@
 - **验证**：模拟 `_run_reinit` 完成态完整（status=completed、running=False、statistics.success=5400/stock_kline=3927687）；编译通过。需重启服务生效。
 
 ### 修复：基础数据页部分股票最新价显示 0 / 数据条数 0（K线缺失）
-- **现象**：数据管理-基础数据页 平安银行（000001）最新价 ¥0、数据条数 0（万科A 正常）。用户怀疑"更新出问题"。
-- **排查链**（日志 + 数据库 + 代码 + 复现实验逐层钉死）：
-  1. 数据库实测：**75 只股票 K线=0**（`stock_basic` 有记录但 `stock_kline` 无任何行）；表结构确认 `stock_basic.code` / `stock_kline.code` 才是股票代码列（无串写）；实时拉数验证 000001/000156/000338 价格一致，**排除 symbol↔code 串写**。
-  2. 日志解析（22:43 全量初始化 53 批次）：事务日志逐批"开始→提交成功"，无回滚/锁定；"命中 100/100"、无保存失败。
-  3. **两类缺失**：**15 只不在任何批次 URL**（`000991/001235/001246/002257/002525/002720/300060/300361/300728/301660/301716/600349/603302/603361/688688`，即 00:33 new_stock_detector 报告的"新股票"）；**60 只在批次 URL 中却未入库**（集中 22:47-22:50）。
-  4. **15 只真相**：名称即铁证——"无效里得""无效恒久"（名称带"无效"）、"蚂蚁集团 688688"（从未上市）、"奥赛康/浙江国祥/胜景山河/立立电子"等均为**历史上 IPO 被否/撤单的申购残留代码**；经 **Tushare（5569 上市+340 退市）与 baostock 双重核验不存在** → **akshare 降级源（东财接口）混入无效申购代码**，写入 stock_basic 后永远无 K线。
-  5. **60 只真相**：当前磁盘代码复现实验（临时库 + 真实 TickFlow 拉 100 只含缺失样本）**100/100 全部入库**；同时复现 TickFlow 100 只批次响应体在 **~4.4MB 处被截断**导致 JSON 解析失败（重试后成功）→ 22:43 那轮为**网络/响应瞬态导致部分批次数据缺失**（非当前代码保存逻辑缺陷）。
-- **修复**：
-  1. **数据修复**：60 只缺失股票已补拉入库（000001 恢复 750 条、最新 2026-09-24）；15 只无效代码已从 `stock_basic` 删除（无任何关联数据，删除安全）。
-  2. **代码根治（黑名单）**：`utils/stock_data_fetcher.py` `get_all_stock_codes` 新增 `invalid_codes` 黑名单（15 只核验不存在的申购残留代码），Tushare/腾讯/akshare 三个源统一过滤；akshare 分支排除关键词增加"无效"。验证：get_all_stock_codes 返回 5203 只、无假代码残留。
-  3. **自动补拉兜底**：`utils/data_initializer.py` `_init_kline_history_data` 保存失败日志 DEBUG→WARNING；记录 `saved_codes` 集合；**初始化完成后校验请求过的股票是否全部入库，缺失自动补拉**（TickFlow→腾讯降级，最多 1 轮），仍缺失仅 WARNING 不计入中断。
-- **验证**：编译通过；冒烟测试（临时库 + 20 只真实拉取）20/20 入库无缺失；库内假代码清零。**黑名单与自动补拉需重启服务生效，数据修复已即时生效**。
+- **现象**：数据管理-基础数据页 某只股票 最新价 ¥0、数据条数 0（其他股票正常）。
+- **根因**（日志 + 数据库 + 代码 + 复现实验钉死）：75 只股票 K线=0（`stock_basic` 有记录但 `stock_kline` 无行，排除 symbol↔code 串写）。**两类缺失**：① 15 只不在任何初始化批次 URL（名称如含"无效"、及历史未上市新股等均为 IPO 被否/撤单的申购残留代码，经 Tushare 与 baostock 双重核验不存在——akshare 降级源混入无效申购代码写入 stock_basic）；② 60 只在批次 URL 中却未入库（复现 TickFlow 批次响应在 ~4.4MB 处被截断导致 JSON 解析失败，属网络/响应瞬态，非保存逻辑缺陷）。
+- **修复**：① 60 只缺失补拉入库、15 只无效代码从 `stock_basic` 删除；② `get_all_stock_codes` 新增 `invalid_codes` 黑名单 + akshare 分支排除"无效"关键词（Tushare/腾讯/akshare 三源统一过滤）；③ `_init_kline_history_data` 保存失败记 WARNING，初始化完成后校验缺失自动补拉（TickFlow→腾讯降级 1 轮）。**黑名单与自动补拉需重启生效，数据修复即时生效**。
 
 ### 修复：狩猎场保存结果与页面计算不一致（保存了旧缓存记录）
-- **现象**：狩猎场计算显示 2 只（如 000411/002238），点"保存"提示"已保存 1 条记录"，且狩猎跟踪里查到的不是页面显示的那 2 只。
-- **排查链**：
-  1. 日志证据：保存请求 `timing_strategy=turtle`，但页面下拉框显示"顺势宝"（value=`macd_bollinger`）→ **计算与保存参数不一致**。
-  2. 前端根因：`index.html` 存在**两个重复 id 的 `#timing-strategy` 下拉框**（其他页面 1119 行 + 狩猎场页 1696 行）。`calculate()` 用 `querySelector('#khunter-page #timing-strategy')`（读到 macd_bollinger），`saveResults()` 用 `getElementById('timing-strategy')`（读到**第一个**=turtle）→ 保存时传了 turtle。
-  3. 后端根因：`KHunterAPI.save()` 内部**重新调用 `process()`**，而 `process()` 的缓存 `_check_cache` 以 **khunter 表已存记录为缓存**（`WHERE hunting_date=? AND timing_strategy=?`）→ 命中了**昨天（09-25 16:16）保存的 (2026-09-24, turtle) 旧记录 600000** → 保存了旧缓存而非用户当前计算的结果。
-- **修复**：
-  1. 前端 `saveResults()`：选择器改为 `#khunter-page #timing-strategy`（与计算一致）；**把当前计算结果 `currentResults` 一并传给保存接口**（所见即所得）。
-  2. 后端 `KHunterAPI.save()`：新增 `results` 参数——**传入结果则直接保存**（不再走 process 命中缓存）；**未传结果则 `force_refresh=True` 强制重算**后再保存。
-  3. `KHunterDataProcessor.process()`：新增 `force_refresh` 参数，为 True 时跳过 `_check_cache` 强制重新计算。
-  4. `routes.khunter_save()`：接收并透传前端 `results` 字段（非列表时忽略，走强制重算）。
-- **验证**：编译通过；mock 验证 save 两条路径——传 results 时 process 调用 0 次、直接保存 2 条；不传时 process 被调用且 `force_refresh=True`；`force_refresh` 跳过缓存逻辑存在；前端 JS 语法检查通过。**需重启服务 + 刷新浏览器生效**。
-- **说明**：历史旧记录（如 600000/turtle）为用户此前保存的数据，予以保留；修复后重新保存会新增正确的 macd_bollinger 结果。
+- **现象**：狩猎场计算显示 2 只，点"保存"却提示"已保存 1 条"，且狩猎跟踪里查到的不是页面显示的那 2 只。
+- **根因**：① 前端 `index.html` 有两个重复 id 的 `#timing-strategy` 下拉框——`calculate()` 读 `#khunter-page #timing-strategy`（顺势宝 macd_bollinger）、`saveResults()` 读 `getElementById`（第一个=turtle），**保存参数与计算不一致**；② 后端 `KHunterAPI.save()` 内部重新调 `process()`，其缓存以 khunter 表已存记录为缓存 → 命中昨天保存的旧记录，**保存了旧缓存而非当前结果**。
+- **修复**：① 前端 `saveResults()` 选择器改 `#khunter-page #timing-strategy` 并把当前结果 `currentResults` 传给保存接口（所见即所得）；② 后端 `save()` 新增 `results` 参数——传入则直接保存，未传则 `force_refresh=True` 强制重算再保存；③ `KHunterDataProcessor.process()` 加 `force_refresh` 跳过 `_check_cache`；④ `routes.khunter_save()` 透传 `results`。历史旧记录保留。**需重启服务 + 刷新浏览器生效**。
 
 ---
 
 ## v4 ｜ 2026-09-27 · 选股池回归全市场（创业板/科创板不再被排除）
 
-### 修复：招标股份（301136）长期不被选股结果命中（3 个策略均缺失）
-- **现象**：选股结果里一直没有"招标股份"，但用户此前见过该公司被 **2560战法 / 多金叉共振策略 / 趋势起点策略** 3 个策略同时选中（信号日 2026-09-24）。
-- **排查链**（数据库 → 代码 → git blame → 实测逐步钉死）：
-  1. 数据库实证：301136 K线 **750 条完整**（2023-08-23 ~ 2026-09-24），09-24 收盘 **13.30**/量 258730、09-23 收盘 11.84/量 48665——与用户提供的选股理由（13.30 > MA25 12.02、量能 2.58 倍等）**完全吻合**；`stock_selection_record` 中该股记录 **0 条**；09-24 全市场 2560战法 1 只 / 多金叉共振 4 只 / 趋势起点 9 只——**策略正常跑了，但从未对 301136 执行**。
-  2. git blame 定位：`web_server.py` run_selection 的 `stock_codes` 过滤"只保留主板（600/601/603/605/000/001/002/003）"由 **62c2dc0「选股加速」引入**（初始版本 ae0fe0b 不过滤，全市场）；`main.py` select 命令同样过滤——**30 开头创业板、68 开头科创板全部被排除出选股池**。
-  3. 实测验证：用当前策略代码 + registry + 数据库对 301136（截至 09-24）执行三个策略——**全部命中**，signals 与用户提供的选股理由**逐字一致**（股价突破25日均线、VOL_MA5=100333/VOL_MA60=73146、收盘价在MA10之上 13.30>12.16、涨幅12.33%、量能2.58倍；均线/KDJ/MACD 三金叉共振；MACD金叉+布林带上穿+阳线+站上5日线+量能放大）→ **策略与数据均无问题，纯粹是股票池过滤排除所致**。
-- **修复**：`web_server.py` run_selection 与 `main.py` select 的过滤条件由"仅主板"改为 **沪市主板 + 深市主板 + 创业板**（代码前 3 位 `600/601/603/605/000/001/002/003/300/301`；排除科创板 688、北交所及其它代码段）。
-- **验证**：新过滤后选股池 **4767 只**（沪市主板 1782 + 深市主板 1575 + 创业板 1411，旧过滤仅 3357 只，恢复创业板 1411 只）；科创板 616 只全部排除（池内 0）；301136（招标股份）在池内；`web_server.py` / `main.py` 编译通过；web_server 完整导入 OK（20 策略正常加载）。**需重启服务生效**。
-- **说明**：2560战法 reason 中"量能 >= 1.2倍"为用户旧版本记录的 1.5 倍——该阈值参数已被调整（`config/strategy_params.yaml`），不影响本案例命中（2.58 倍均满足）；如需恢复 1.5 可自行调整。
+### 修复：某创业板股长期不被选股结果命中（3 个策略均缺失）
+- **现象**：选股结果里一直没有某只股票，但用户此前见过其被 **2560战法 / 多金叉共振 / 趋势起点** 3 个策略同时选中（信号日 2026-09-24）。
+- **根因**（数据库 → 代码 → git blame → 实测钉死）：① 该股 K线 750 条完整、09-24 收盘 13.30/量能 2.58 倍等与用户选股理由**逐字一致**，且 `stock_selection_record` 该股 0 条、当天其他策略正常跑 → **策略与数据无问题**；② git blame 定位 `web_server.py` run_selection 与 `main.py` select 的过滤"仅保留主板（600/601/603/605/000/001/002/003）"由 62c2dc0「选股加速」引入 → **30 开头创业板、68 开头科创板全被排除出选股池**。
+- **修复**：两处过滤条件改为 **沪市主板 + 深市主板 + 创业板**（`600/601/603/605/000/001/002/003/300/301`，排除科创板 688、北交所）。
+- **验证**：选股池 3357 → **4767 只**（恢复创业板 1411 只），科创板 616 只全排除；该股在池内；编译 + 20 策略加载 OK。**需重启服务生效**。
 
 ### 修复：保存选股结果时触发行业数据源拉取导致 ERROR/ProxyError 刷屏
 - **现象**：选股结果页点"保存结果"，日志大量出现 `所有数据源都获取失败`、`ProxyError('Unable to connect to proxy', RemoteDisconnected(...))`、tushare `stock_basic` 反复重试（3 源 × 3 次全表拉取）。
 - **排查链**：
   1. 保存 66 只选股结果时，`save_selection_result` 对每只股票调 `_get_stock_industry`：**stock_basic 表行业为空则走 `IndustryFetcher` 数据源拉取**（tushare → 东财行业 → 东财行业排名，各 3 次重试）。
-  2. 实测 tushare `stock_basic`：返回 5569 行、列名正常，但 **002505 / 600321 匹配行数 = 0**（镜像缺失/退市状态股票，**从任何源都拉不到行业**）；本地库 **5385 只中 183 只行业为空**（含 002505、600321）。
+  2. 实测 tushare `stock_basic`：返回 5569 行、列名正常，但部分退市/特殊股（如示例代码）匹配行数 = 0（镜像缺失/退市状态股票，**从任何源都拉不到行业**）；本地库 **5385 只中 183 只行业为空**。
   3. 东财行业源经 akshare 底层 requests **走系统代理**（`127.0.0.1:7688`，代理软件已关闭）→ `ProxyError` → 三源全失败 → ERROR 刷屏；同时每次保存对空行业股票做 9 次全表 stock_basic 请求，严重拖慢保存。
 - **修复**：`_get_stock_industry` 改为**只读 stock_basic 表**（有则返回，空则返回空字符串），**不再触发任何数据源网络拉取**；行业补全统一由数据初始化流程负责。保存选股结果全链路零网络调用（行业/价格/关键日期均为本地读取）。
-- **验证**：000001 → 'J66货币金融服务'、301136 → 'M74专业技术服务业'（DB 命中）；002505 / 600321 / 不存在代码 → ''（无网络调用）；`selection_record_manager.py` 编译通过。**需重启服务生效**。
+- **验证**：示例股 → 'J66货币金融服务'、另一示例股 → 'M74专业技术服务业'（DB 命中）；退市/特殊股 / 不存在代码 → ''（无网络调用）；`selection_record_manager.py` 编译通过。**需重启服务生效**。
 - **遗留说明**：183 只行业为空股票如需补全行业，可在数据初始化时补拉（此时仍会触发数据源，东财源代理问题待后续在初始化链路统一处理）；不影响保存功能。
 
 ### 修复：市场速览"最热板块"显示未知 + 点股票数量打开为空
 - **现象**：市场速览-最热板块排名 1 显示"未知"、股票数量 50、占比 100%；点股票数量打开为空。
 - **排查链**（数据库 → 代码 → 接口实测）：
   1. 最热板块数据来自 `stock_selection_record.sector`（保存选股结果后由 ranking_manager 排名更新写入）；2026-09-24 共 68 条 **sector 全空** → 全部归为"未知"。
-  2. sector 来源链：排名更新读 `stock_score_detail.sector_details.sector_name` → 评分时板块未产出（sector_name=""）→ 手动实测板块评分链路（ths_member / ths_index / ths_daily / moneyflow_cnt_ths）**Tushare 全部可用**（000001 算 100 分/最优板块"证金持股"），但选股评分批次中部分股票 ths_member 失败/无映射 → 板块详情空。
-  3. 板块源实证：000001/301136/600292 有板块映射（56/80/73 个）；002505/600321 等退市/特殊股无板块。
+  2. sector 来源链：排名更新读 `stock_score_detail.sector_details.sector_name` → 评分时板块未产出（sector_name=""）→ 手动实测板块评分链路（ths_member / ths_index / ths_daily / moneyflow_cnt_ths）**Tushare 全部可用**（示例股算 100 分/最优板块"证金持股"），但选股评分批次中部分股票 ths_member 失败/无映射 → 板块详情空。
+  3. 板块源实证：部分股票有板块映射（56/80/73 个）；部分退市/特殊股无板块。
 - **修复**：
-  1. **补算存量板块**：对 09-24 选股记录 68 条复用单个 SectorScorer（预热板块映射缓存）重算板块并回填 `stock_selection_record.sector`——**66 条拿到真实板块**（物联网/新能源汽车/证金持股/一带一路等），仅 002505、600321（退市股）无板块无行业。
+  1. **补算存量板块**：对 09-24 选股记录 68 条复用单个 SectorScorer（预热板块映射缓存）重算板块并回填 `stock_selection_record.sector`——**66 条拿到真实板块**（物联网/新能源汽车/证金持股/一带一路等），仅个别退市股无板块无行业。
   2. **评分链路兜底**：`ranking_manager._get_best_sector` 板块未产出时回退 `stock_basic.industry`，保证 sector 非空、不再出现"未知"。
   3. **接口兜底**：`/api/dashboard/hot-areas` 查询 `SELECT sector, industry`，`sector 为空时用 industry` 兜底展示。
-- **验证**：最热板块 top10 现为物联网 8 只(11.8%)/新能源汽车 6 只(8.8%)/证金持股 5 只(7.4%) 等真实板块；点"物联网"股票数量查到 5 只（宁水集团/厦门信达/立达信等）；`ranking_manager.py`/`web_server.py` 编译通过。**存量数据已即时生效，兜底逻辑需重启服务生效**。
+- **验证**：最热板块 top10 现为物联网 8 只(11.8%)/新能源汽车 6 只(8.8%)/证金持股 5 只(7.4%) 等真实板块；点"物联网"股票数量查到 5 只（示例个股）；`ranking_manager.py`/`web_server.py` 编译通过。**存量数据已即时生效，兜底逻辑需重启服务生效**。
 
 ### 优化：选股策略"精选手池 + 每策略最多1只"（广撒网 92 -> 精选）
 - **目标**：09-27 执行选股 92 只（交集率仅11%），用户要求收窄到高确定性信号 + 每个策略最多 1 只，结合 A 股主力特性（高开多兑现、利好兑现利空爆拉、一致看好直接兑现、逆人性低吸）。
@@ -148,7 +121,7 @@
   2. **各策略合并一行**：同一策略的股票 `code 名称 价格 ・ ...` 合并为一行，替代逐条罗列。
   3. **去除列表精简**：去除股票只列前 10 只 + "…等 N 只"（不再全列 63 只）；新增列表合并一行。
   4. **股票去重**：`_all_stocks` 按 code 去重；买入建议循环加 `_seen_codes` 去重（同股票只 analyze 一次，不再重复出现）。
-- **验证**：模拟 `cleaned_results`（5 只、3 只多策略共振）输出正确——共振置顶 301213（回马枪+W底）/603997（W底+趋势加速）/301136（2560+多金叉），各策略合并一行，买入去重后只跑 5 次 analyze。`web_server.py` 编译通过，**需重启服务生效**。
+- **验证**：模拟 `cleaned_results`（5 只、3 只多策略共振）输出正确——共振置顶 3 只（回马枪+W底 / W底+趋势加速 / 2560+多金叉），各策略合并一行，买入去重后只跑 5 次 analyze。`web_server.py` 编译通过，**需重启服务生效**。
 
 - **钉钉推送补全**：项目此前**只有配置（config.yaml 钉钉 webhook/secret）、无任何发送实现**（无 DingTalkNotifier，web_server 只推飞书）→ 新增 `utils/dingtalk_notifier.py`（DingTalkNotifier，含**加签** HMAC-SHA256：timestamp+secret → base64 → `&timestamp=&sign=`），web_server 推送段在飞书后并列推钉钉（未配置时静默跳过）。验证：加签 URL 正确含 timestamp/sign，payload msgtype=text 正确；编译通过。**需重启服务生效**。追加：**钉钉推送增加开关**——`config.yaml` 的 `dingtalk.enabled`（默认 true）；web_server 钉钉段先判断 `enabled`，为 false 时跳过（log "钉钉推送已关闭"），config.yaml.template 同步。验证：config.yaml 读取 enabled=True；编译通过。**需重启服务生效**。**飞书推送同步加开关**——`config.yaml` 的 `feishu.enabled`（默认 true），template 补 feishu 段；web_server 飞书发送段先判断 `enabled`，为 false 时跳过。验证：config.yaml 读取 feishu.enabled=True、dingtalk.enabled=True；编译通过。**需重启服务生效**。
 
