@@ -1043,6 +1043,94 @@ def run_selection():
                 import os
                 _max_workers = min(os.cpu_count() or 4, len(strategies_to_execute), 8)
 
+                def _position_score(code, df):
+                    """每策略多选时，按股价位置+主力行为+强者恒强+龙头多一条命打分选1。
+                    加分：月线低位、距120日高点回撤大(低吸)、站上关键均线+近5日创新高(强者恒强)、连板涨停(龙头多一条命)
+                    减分：20日涨幅大(兑现)、量能比>3(巨量出货)、高开>3%(高开兑现)、乖离>10%(兑现回调风险)"""
+                    try:
+                        import pandas as pd
+                        latest = df.iloc[0]
+                        close = latest['close']
+                        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
+
+                        # ===== 位置看月线（低位加分/高位减分）=====
+                        pos_score = 0.0
+                        try:
+                            d = df.iloc[::-1].reset_index(drop=True)
+                            monthly = d.resample('ME', on='date').agg({'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+                            if len(monthly) >= 6:
+                                m_high = monthly['high'].tail(12).max()
+                                m_low = monthly['low'].tail(12).min()
+                                if m_high > m_low:
+                                    month_pos = (close - m_low) / (m_high - m_low)
+                                    pos_score = 60 * (0.5 - month_pos) if month_pos < 0.5 else -50 * (month_pos - 0.5)
+                        except Exception:
+                            pos_score = 0.0
+
+                        # ===== 日线低吸机会（距120日高点回撤）=====
+                        high120 = df.head(120)['high'].max()
+                        drawdown = (high120 - close) / high120 if high120 > 0 else 0
+                        dd_score = drawdown * 30
+
+                        # ===== 20日涨幅（越大越接近兑现）=====
+                        base = df.head(20)['close'].iloc[-1] if len(df) >= 20 else prev_close
+                        rise20 = (close - base) / base if base > 0 else 0
+                        rise_penalty = -rise20 * 60
+
+                        # ===== 乖离率：距5日线/布林上轨>10% 兑现回调风险 =====
+                        ma5 = df.head(5)['close'].mean()
+                        ma20c = df.head(20)['close'].mean()
+                        std20 = df.head(20)['close'].std()
+                        boll_up = ma20c + 2 * std20
+                        gap_ma5 = (close - ma5) / ma5 if ma5 > 0 else 0
+                        gap_boll = (close - boll_up) / boll_up if boll_up and boll_up > 0 else 0
+                        deviate_penalty = 0.0
+                        if abs(gap_ma5) > 0.10:
+                            deviate_penalty += -40
+                        if gap_boll and gap_boll > 0.10:
+                            deviate_penalty += -40
+
+                        # ===== 强者恒强加分（站上关键均线+近5日创新高）=====
+                        ma10 = df.head(10)['close'].mean()
+                        ma20v = df.head(20)['close'].mean()
+                        strength = 0.0
+                        if close > ma5: strength += 5
+                        if close > ma10: strength += 5
+                        if close > ma20v: strength += 5
+                        high6 = df.head(6)['high'].max()
+                        if high6 > 0 and close >= high6:
+                            strength += 10  # 近5日创新高，强者恒强
+
+                        # ===== 龙头多一条命（近5日涨停/连板天数，提供风险容差）=====
+                        limit_days = 0
+                        try:
+                            d2 = df.iloc[::-1].reset_index(drop=True)
+                            for i in range(len(d2) - 1, max(len(d2) - 6, 0), -1):
+                                pc = d2['close'].iloc[i - 1]
+                                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
+                                    limit_days += 1
+                        except Exception:
+                            limit_days = 0
+                        strength += min(limit_days, 3) * 8  # 连板=龙头多一条命
+
+                        # ===== 龙头容差：强者/龙头适当抵消高位与乖离惩罚 =====
+                        tolerance = min(strength, 20) * 0.5
+
+                        # ===== 放巨量滞涨=出货；放量上涨=强势（不设高开惩罚：盘后选股高开已无意义）=====
+                        v5 = df.head(5)['volume'].mean()
+                        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
+                        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
+                        trap_penalty = 0.0
+                        if vol_ratio > 3 and chg < 0.01:
+                            trap_penalty = -60  # 放巨量但滞涨/收阴=主力出货
+                        elif vol_ratio > 1.5 and chg > 0.03:
+                            trap_penalty = 10  # 放量上攻=强者恒强
+
+                        score = pos_score + dd_score + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty
+                        return round(score, 2)
+                    except Exception:
+                        return -9999
+
                 def _run_strategy(item):
                     sname, sobj = item
                     s_display = strategy_display_names.get(sname, sname)
@@ -1061,6 +1149,17 @@ def run_selection():
                                 })
                         except Exception:
                             errs += 1
+                    # 每策略最多1只：按股价位置/主力行为打分选最优（逆人性低吸优先）
+                    if len(sigs) > 1:
+                        scored = []
+                        for _s in sigs:
+                            _df = stock_data.get(_s['code'], (None, None))[1]
+                            _sc = _position_score(_s['code'], _df) if _df is not None else -9999
+                            scored.append((_sc, _s))
+                        scored.sort(key=lambda x: -x[0])
+                        sigs = [scored[0][1]]
+                        func_logger.info(f"策略 {sname} 命中 {len(scored)} 只，位置打分选1: {sigs[0]['code']} {sigs[0]['name']} (score={scored[0][0]})")
+
                     func_logger.info(f"策略 {sname} 完成 - 选中 {len(sigs)} 只，耗时 {(dt.now()-t0).total_seconds():.1f}秒")
                     return sname, sigs, errs
 
@@ -1291,23 +1390,56 @@ def run_selection():
             _lines = [f"📊 缅A每日推送 ({dt.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
             _total = 0
             _all_stocks = []
+            _stock_strategies = {}   # code -> [策略名]（用于多策略共振置顶）
+            _stock_prices = {}       # code -> 价格
 
+            # ── 第一遍：收集所有股票 + 各自命中的策略（去重）──
             for _sname, _signals in cleaned_results.items():
                 if isinstance(_signals, list) and _signals:
-                    _lines.append(f"【{_sname}】: {len(_signals)} 只")
                     for _s in _signals:
-                        _name = _s.get('name', '')
                         _code = _s.get('code', '')
+                        _name = _s.get('name', '')
                         _sig = _s.get('signals', [])
-                        if _sig:
-                            _lines.append(f"  {_code} {_name} 价格:{_sig[0].get('close','-')}")
-                        else:
-                            _lines.append(f"  {_code} {_name}")
-                        _all_stocks.append({'code': _code, 'name': _name})
-                    _lines.append("")
-                    _total += len(_signals)
+                        if _code:
+                            if _code not in _stock_strategies:
+                                _stock_strategies[_code] = []
+                                _stock_prices[_code] = _sig[0].get('close', '-') if _sig else '-'
+                                _all_stocks.append({'code': _code, 'name': _name})
+                            _stock_strategies[_code].append(_sname)
+            _total = len(_all_stocks)
+            _multi = {c: s for c, s in _stock_strategies.items() if len(s) >= 2}
 
-            # 与上一日对比：新增/去除
+            # ── 标题 + 总数 ──
+            _lines[1] = f"共 {_total} 只入选 ｜ {len(_multi)} 只多策略共振"
+
+            # ── ⭐ 多策略共振置顶推荐 ──
+            if _multi:
+                _lines.append("━━━━━━━━━━━━━━━━━━━━")
+                _lines.append("⭐ 重点推荐 · 多策略共振（置顶）")
+                _lines.append("")
+                for _code, _strats in sorted(_multi.items(), key=lambda x: -len(x[1])):
+                    _nm = next((s['name'] for s in _all_stocks if s['code'] == _code), '')
+                    _lines.append(f"🟢 {_code} {_nm} {_stock_prices[_code]}")
+                    _lines.append(f"   ✦ {len(_strats)} 策略共振：{' · '.join(_strats)}")
+                    _lines.append("")
+
+            # ── 📋 各策略入选（精简合并一行）──
+            _lines.append("━━━━━━━━━━━━━━━━━━━━")
+            _lines.append(f"📋 各策略入选（{_total} 只）")
+            _lines.append("")
+            for _sname, _signals in cleaned_results.items():
+                if isinstance(_signals, list) and _signals:
+                    _tokens = []
+                    for _s in _signals:
+                        _code = _s.get('code', '')
+                        _name = _s.get('name', '')
+                        _sig = _s.get('signals', [])
+                        _px = _sig[0].get('close', '') if _sig else ''
+                        _tokens.append(f"{_code} {_name}" + (f" {_px}" if _px and _px != '-' else ''))
+                    _lines.append(f"【{_sname}】{' ・ '.join(_tokens)}")
+            _lines.append("")
+
+            # 与上一日对比：新增/去除（去除精简为一行）
             if _total > 0:
                 try:
                     from utils.selection_record_manager import SelectionRecordManager
@@ -1335,29 +1467,28 @@ def run_selection():
                         if _new_codes or _removed_codes:
                             _lines.append("━━━━━━━━━━━━━━━━━━━━")
                             _lines.append(f"📋 与 {_prev_date} 对比")
-                            _lines.append("")
                             if _new_codes:
                                 _new_names = [f"{s['code']} {s['name']}" for s in _all_stocks if s['code'] in _new_codes]
-                                _lines.append(f"  🟢 新增 ({len(_new_codes)}只):")
-                                for _n in _new_names:
-                                    _lines.append(f"    + {_n}")
+                                _lines.append(f"🟢 新增 ({len(_new_codes)}只): {' ・ '.join(_new_names)}")
                             if _removed_codes:
-                                _lines.append(f"  🔴 去除 ({len(_removed_codes)}只):")
-                                for _rc in _removed_codes:
-                                    _lines.append(f"    - {_rc}")
+                                _rlist = sorted(_removed_codes)
+                                _show = ' ・ '.join(_rlist[:10])
+                                _tail = f" …等{len(_rlist)}只" if len(_rlist) > 10 else ''
+                                _lines.append(f"🔴 去除 ({len(_rlist)}只): {_show}{_tail}")
                             _lines.append("")
                 except Exception as _diff_err:
                     func_logger.warning(f"对比历史选股失败: {_diff_err}")
-
-            if _total > 0:
-                _lines.insert(1, f"共 {_total} 只股票入选")
 
             # ─── 买入建议分析 ───
             if _all_stocks:
                 try:
                     from simple_analyzer import analyze_stock, format_analysis_message
                     _analyses = []
+                    _seen_codes = set()
                     for _stock in _all_stocks:
+                        if _stock['code'] in _seen_codes:
+                            continue
+                        _seen_codes.add(_stock['code'])
                         _a = analyze_stock(_stock['code'], _stock['name'])
                         if _a['score'] > 0:
                             _analyses.append(_a)
@@ -1447,8 +1578,31 @@ def run_selection():
                 func_logger.warning(f"获取大盘数据失败: {_idx_err}")
 
             if _total > 0:
-                _notifier.send_text("\n".join(_lines))
-                func_logger.info(f"飞书推送完成，共 {_total} 只股票入选")
+                _msg_text = "\n".join(_lines)
+                # 飞书推送（enabled=false 时跳过）
+                _feishu_enabled = _cfg.get('feishu', {}).get('enabled', True)
+                if not _feishu_enabled:
+                    func_logger.info("飞书推送已关闭（enabled=false），跳过")
+                else:
+                    _notifier.send_text(_msg_text)
+                    func_logger.info(f"飞书推送完成，共 {_total} 只股票入选")
+                # 钉钉推送（与飞书并列；未配置或 enabled=false 时跳过）
+                try:
+                    from utils.dingtalk_notifier import DingTalkNotifier
+                    _ding_cfg = _cfg.get('dingtalk', {})
+                    if not _ding_cfg.get('enabled', True):
+                        func_logger.info("钉钉推送已关闭（enabled=false），跳过")
+                    else:
+                        _ding = DingTalkNotifier(
+                            _ding_cfg.get('webhook_url', ''),
+                            _ding_cfg.get('secret', ''),
+                        )
+                        if _ding.send_text(_msg_text):
+                            func_logger.info("钉钉推送完成")
+                        else:
+                            func_logger.warning("钉钉推送未完成（webhook 未配置或失败）")
+                except Exception as _ding_err:
+                    func_logger.warning(f"钉钉推送失败: {_ding_err}")
             else:
                 func_logger.info("选股结果为空，跳过飞书推送")
         except Exception as _fe:

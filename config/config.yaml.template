@@ -13,8 +13,15 @@ data_dir: data
 # 2. 复制 webhook URL 和加签密钥
 # 3. 填入下方（去掉引号内的占位符）
 dingtalk:
+  enabled: true  # 钉钉推送开关：true=启用，false=关闭
   webhook_url: "https://oapi.dingtalk.com/robot/send?access_token=YOUR_TOKEN_HERE"
   secret: "YOUR_SECRET_HERE"
+
+# 飞书机器人配置
+# 在飞书群中添加自定义机器人，复制 webhook URL
+feishu:
+  enabled: true  # 飞书推送开关：true=启用，false=关闭
+  webhook_url: "https://open.feishu.cn/open-apis/bot/v2/hook/YOUR_HOOK_HERE"
 
 # 定时任务配置
 schedule:
