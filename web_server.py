@@ -148,6 +148,9 @@ logger.info("=" * 60)
 logger.info("Web服务器启动")
 logger.info("=" * 60)
 
+# 市场情绪当日缓存（高开低走动态阈值用）：date/up_ratio/status
+_market_sentiment_cache = {'date': None, 'up_ratio': None, 'status': None}
+
 
 # 初始化数据库（确保所有表都已创建）
 logger.info("初始化数据库...")
@@ -1043,10 +1046,52 @@ def run_selection():
                 import os
                 _max_workers = min(os.cpu_count() or 4, len(strategies_to_execute), 8)
 
-                def _position_score(code, df):
+                # 逆势低吸类策略（买弱/买回调/买低位）：不适用"强者恒强豁免"与"该强不强"弱态扣分，
+                # 否则与策略初衷冲突（超跌/回踩/低位本就是"弱"状态）；保留位置/回撤/巨量滞涨等基础项。
+                DIP_STRATEGIES = {'OversoldReboundStrategy', 'WBottomStrategy', 'LimitUpPullbackStrategy',
+                                  'MainUptrendDipBuyStrategy', 'LowTD9Strategy', 'MorningStarStrategy',
+                                  'BottomTrendInflectionStrategy'}
+
+                def _get_market_sentiment(trade_date):
+                    """当日市场情绪风向：上涨家数占比 up_ratio(0~1)。本地 market_temperature 表优先；
+                    无则 MarketTemperature 实时计算(DB缓存兜底)；失败回退 0.5(正常)。同日模块级缓存。"""
+                    global _market_sentiment_cache
+                    key = str(trade_date)
+                    if _market_sentiment_cache.get('date') == key:
+                        return _market_sentiment_cache
+                    up_ratio, status = None, None
+                    try:
+                        from trading.market_temperature_dao import MarketTemperatureDAO
+                        row = MarketTemperatureDAO().query_by_date(key)
+                        if row:
+                            up = row.get('up_count') or 0
+                            down = row.get('down_count') or 0
+                            if up + down > 0:
+                                up_ratio = up / (up + down)
+                                status = row.get('status')
+                    except Exception:
+                        pass
+                    if up_ratio is None:
+                        try:
+                            from utils.market_temperature import MarketTemperature
+                            d = MarketTemperature().calculate(key, use_cache=True, skip_risk_eval=True)
+                            up = d.get('up_count') or 0
+                            down = d.get('down_count') or 0
+                            if up + down > 0:
+                                up_ratio = up / (up + down)
+                                status = d.get('status')
+                        except Exception:
+                            pass
+                    if up_ratio is None:
+                        up_ratio, status = 0.5, '正常'
+                    _market_sentiment_cache = {'date': key, 'up_ratio': up_ratio, 'status': status}
+                    return _market_sentiment_cache
+
+                def _position_score(code, df, strategy_name=''):
                     """每策略多选时，按股价位置+主力行为+强者恒强+龙头多一条命打分选1。
                     加分：月线低位、距120日高点回撤大(低吸)、站上关键均线+近5日创新高(强者恒强)、连板涨停(龙头多一条命)
-                    减分：20日涨幅大(兑现)、量能比>3(巨量出货)、高开>3%(高开兑现)、乖离>10%(兑现回调风险)"""
+                    减分：20日涨幅大(兑现)、量能比>3(巨量出货)、高开>3%(高开兑现)、乖离>10%(兑现回调风险)
+                    低吸类策略(strategy_name in DIP_STRATEGIES)跳过强者恒强豁免与弱态扣分。"""
                     try:
                         import pandas as pd
                         latest = df.iloc[0]
@@ -1126,10 +1171,142 @@ def run_selection():
                         elif vol_ratio > 1.5 and chg > 0.03:
                             trap_penalty = 10  # 放量上攻=强者恒强
 
-                        score = pos_score + dd_score + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty
+                        # ===== 强者恒强豁免：持续创新高 + 量价健康（无加速/出货）→ 位置高低影响不大 =====
+                        # 用户平衡：个股足够强势（不断破新高）且没有加速和出货迹象，位置高不应重扣；
+                        # 但加速赶顶（5日涨幅过猛）或出货（巨量滞涨）仍照扣（兑现风险）。
+                        try:
+                            if strategy_name not in DIP_STRATEGIES:  # 低吸类不套用强者恒强豁免
+                                rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
+                                high20 = df.head(20)['high'].max()
+                                creating_new_high = high20 > 0 and close >= high20  # 收盘创近20日新高（持续破新高）
+                                healthy = (
+                                    vol_ratio < 5                      # 无明显极端放量
+                                    and not (vol_ratio > 3 and chg < 0.01)  # 非巨量滞涨（出货）
+                                    and rise5 < 0.25                    # 5日未涨超25%（无加速赶顶）
+                                )
+                                if creating_new_high and strength >= 15 and healthy:
+                                    if pos_score < 0:                    # 只弱化高位扣分，低位加分不动
+                                        pos_score = pos_score * 0.3
+                                    rise_penalty = rise_penalty * 0.5    # 20日涨幅兑现惩罚减半
+                                    deviate_penalty = deviate_penalty * 0.3  # 乖离容忍（强者不惧偏离）
+                        except Exception:
+                            pass
+
+                        # ===== 该强不强就是弱：本应走强却走弱 → 扣分（弱势股及时抽身）=====
+                        try:
+                            weak = 0.0
+                            if strategy_name not in DIP_STRATEGIES:  # 低吸类买的就是弱转强，不套用弱态扣分
+                                if vol_ratio > 1.5 and chg < 0:        # 放量却收阴/平盘=量给了没涨（该强不强）
+                                    weak -= 25
+                                if limit_days > 0 and chg < -0.01 and vol_ratio > 1.5:  # 放量断板走弱（缩量回调=健康回踩）
+                                    weak -= 15
+                                recent_close_max = df.head(3)['close'].max()
+                                if high20 > 0 and recent_close_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:  # 放量冲高未破回落至5日线下
+                                    weak -= 20
+                        except Exception:
+                            weak = 0.0
+
+                        # ===== 打分=小建议（排序用）：强者恒强加分 + 位置/涨幅/乖离风险修正 + 弱态/出货小扣 =====
+                        # 核心信号由策略规则 + 假信号过滤承担，打分仅决定"每策略多选时选哪 1 只"
+                        if strategy_name in DIP_STRATEGIES:
+                            # 低吸类：位置主导（买弱转强，低位低吸优先）
+                            score = pos_score + dd_score + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
+                        else:
+                            # 顺势/追强类：强度优先（强者恒强），位置仅轻量修正（×0.5）
+                            score = pos_score * 0.5 + dd_score * 0.5 + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
                         return round(score, 2)
                     except Exception:
                         return -9999
+
+                def _is_fake_signal(code, df, strategy_name):
+                    """规则层假信号规避（主力阴招）：策略命中后剔除假信号，核心信号规则之一。
+                    全局：放巨量滞涨(出货)、高开低走(高开兑现回落)
+                    追强类额外：加速赶顶(5日涨超25%)、乖离过大(>15%)、放量假突破(突破20日高回落MA5下)、放量断板大跌
+                    低吸类不排除假突破/加速/乖离（买入点即回调/低位）"""
+                    try:
+                        latest = df.iloc[0]
+                        close = latest['close']
+                        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
+                        open_p = latest['open'] if 'open' in latest else close
+                        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
+                        v5 = df.head(5)['volume'].mean()
+                        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
+                        ma5 = df.head(5)['close'].mean()
+                        is_dip = strategy_name in DIP_STRATEGIES
+                        # 全局：放巨量滞涨=出货
+                        if vol_ratio > 3 and chg < 0.01:
+                            return True, '放巨量滞涨(出货)'
+                        # 高开低走需分辨（量价二维 + 市场情绪动态阈值，避免极端行情误杀跟跌）：
+                        #  · 市场情绪动态阈值：极端普跌(涨家占比<0.3)→放宽8%(个股多为跟跌，非独立出货)；偏强(>0.6)→收紧4%(独立跌=真出货)；正常→5%
+                        #  · 量能主动分档（缩量=洗盘特征/放量=出货特征）：
+                        #      - 明显缩量(量比<1.0)=无量下杀，非主力派发→洗盘，仅极端下杀(跌幅>阈值+3%或>10%)算出货
+                        #      - 温和量(1.0~1.5)=按市场情绪动态阈值判断
+                        #      - 明显放量(量比>1.5)=主力借高开派发→跌破MA5 或 跌幅超阈值 即算出货
+                        #  · 其余（缩量温和回落 / 守住MA5 / 跌幅小）= 洗盘（无量回踩浮筹，之后仍可能拉升）→ 保留
+                        if prev_close > 0 and (open_p / prev_close - 1) > 0.03 and close < prev_close:
+                            day_drop = (prev_close - close) / prev_close
+                            try:
+                                _td = str(df['date'].iloc[0]).replace('-', '')
+                                _up_ratio = _get_market_sentiment(_td).get('up_ratio', 0.5)
+                            except Exception:
+                                _up_ratio = 0.5
+                            if _up_ratio < 0.3:
+                                drop_thresh = 0.08
+                            elif _up_ratio > 0.6:
+                                drop_thresh = 0.04
+                            else:
+                                drop_thresh = 0.05
+                            if vol_ratio < 1.0:
+                                # 明显缩量=洗盘特征，仅极端下杀(超市场阈值+3%或>10%)才算出货
+                                if day_drop > max(drop_thresh + 0.03, 0.10):
+                                    return True, '高开低走(缩量极端下杀)'
+                            elif vol_ratio > 1.5:
+                                # 明显放量=出货特征，跌破MA5 或 跌幅超阈值 即剔
+                                if close < ma5 or day_drop > drop_thresh:
+                                    return True, '高开低走(放量出货)'
+                            else:
+                                # 温和量(1.0~1.5)：按市场情绪动态阈值
+                                if day_drop > drop_thresh:
+                                    return True, '高开低走(出货)'
+                        if is_dip:
+                            return False, ''
+                        # 追强类：加速赶顶（多维，不只5日涨幅）——龙头策略豁免（连板加速是龙头常态）
+                        #  主信号：5日涨幅>25% 或 10日涨幅>40%（补10日维度，防单日跳空虚高漏判/误判）
+                        #  确认（任一）：放量(量比>1.5)、乖离MA20>15%、高位(距120日高点回撤<10%)
+                        #  排除：缩量+低乖离+非高位的健康上行（强者恒强，不误杀）
+                        rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
+                        rise10 = (close / df.head(10)['close'].iloc[-1] - 1) if len(df) >= 11 else 0
+                        if strategy_name != 'LeaderStrategy' and (rise5 >= 0.25 or rise10 >= 0.40):
+                            _ma20v = df.head(20)['close'].mean()
+                            _bias20 = (close - _ma20v) / _ma20v if _ma20v > 0 else 0
+                            _high120 = df.head(120)['high'].max()
+                            _near_high = _high120 > 0 and (_high120 - close) / _high120 < 0.10
+                            if vol_ratio > 1.5 or _bias20 > 0.15 or _near_high:
+                                return True, '加速赶顶(短期涨幅过大+放量/乖离/高位)'
+                        # 追强类：乖离过大（距MA5>15%，随时兑现）——龙头策略豁免
+                        if strategy_name != 'LeaderStrategy' and ma5 > 0 and (close - ma5) / ma5 > 0.15:
+                            return True, '乖离过大(>15%)'
+                        # 追强类：放量假突破（近3日曾触20日新高，今日放量跌破MA5=突破失败）
+                        high20 = df.head(20)['high'].max()
+                        recent_max = df.head(3)['close'].max()
+                        if high20 > 0 and recent_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:
+                            return True, '放量假突破'
+                        # 追强类：放量断板大跌（近2日有涨停，今日放量跌>5%=断板出货）
+                        try:
+                            d2 = df.iloc[::-1].reset_index(drop=True)
+                            has_limit = False
+                            for i in range(len(d2) - 1, max(len(d2) - 3, 0), -1):
+                                pc = d2['close'].iloc[i - 1]
+                                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
+                                    has_limit = True
+                                    break
+                            if has_limit and chg < -0.05 and vol_ratio > 1.5:
+                                return True, '放量断板大跌'
+                        except Exception:
+                            pass
+                        return False, ''
+                    except Exception:
+                        return False, ''
 
                 def _run_strategy(item):
                     sname, sobj = item
@@ -1141,6 +1318,10 @@ def run_selection():
                         try:
                             r = sobj.analyze_stock(code, name, df)
                             if r:
+                                fake, fake_reason = _is_fake_signal(code, df, sname)
+                                if fake:
+                                    func_logger.info(f"策略 {sname} 剔除假信号 {code} {name}: {fake_reason}")
+                                    continue
                                 sigs.append({
                                     'code': r['code'],
                                     'name': r.get('name', stock_names.get(code, '未知')),
@@ -1154,7 +1335,7 @@ def run_selection():
                         scored = []
                         for _s in sigs:
                             _df = stock_data.get(_s['code'], (None, None))[1]
-                            _sc = _position_score(_s['code'], _df) if _df is not None else -9999
+                            _sc = _position_score(_s['code'], _df, sname) if _df is not None else -9999
                             scored.append((_sc, _s))
                         scored.sort(key=lambda x: -x[0])
                         sigs = [scored[0][1]]
