@@ -1383,7 +1383,8 @@ def run_selection():
             func_logger.info("应用过滤条件...")
             # 直接从配置文件读取过滤配置
             import yaml
-            with open('config/config.yaml', 'r', encoding='utf-8') as f:
+            from pathlib import Path as _Path
+            with open(_Path(__file__).resolve().parent / 'config' / 'config.yaml', 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
             filter_config = config.get('filters', {})
             stock_filter = StockFilter(filter_config)
@@ -1563,7 +1564,8 @@ def run_selection():
         try:
             from utils.feishu_notifier import FeishuNotifier
             import yaml as _yaml
-            with open('config/config.yaml', 'r', encoding='utf-8') as _f:
+            from pathlib import Path as _Path
+            with open(_Path(__file__).resolve().parent / 'config' / 'config.yaml', 'r', encoding='utf-8') as _f:
                 _cfg = _yaml.safe_load(_f)
             _feishu_cfg = _cfg.get('feishu', {})
             _webhook_url = os.environ.get('FEISHU_WEBHOOK') or _feishu_cfg.get('webhook_url', '')
@@ -1680,6 +1682,46 @@ def run_selection():
                 except Exception as _a_err:
                     func_logger.warning(f"买入建议分析失败: {_a_err}")
 
+            # ─── 前3天推荐股票操作建议（持有/卖出位置）───
+            try:
+                from utils.selection_record_manager import SelectionRecordManager
+                from simple_analyzer import generate_advice_for_hold
+                _srm_adv = SelectionRecordManager()
+                _today_adv = dt.now().strftime('%Y-%m-%d')
+                _hist_adv = _srm_adv.get_selection_history({'end_date': _today_adv}, page=1, limit=5000)
+                _rec_by_date = {}
+                for _r in (_hist_adv.get('data') or []):
+                    _d = _r.get('selection_date', '')
+                    if _d and _d < _today_adv:
+                        _rec_by_date.setdefault(_d, []).append(_r)
+                _last3 = sorted(_rec_by_date.keys())[-3:]
+                if _last3:
+                    _adv_stocks = {}
+                    for _d in _last3:
+                        for _r in _rec_by_date[_d]:
+                            _c = _r.get('stock_code', '')
+                            if _c and _c not in _adv_stocks:
+                                _adv_stocks[_c] = {'name': _r.get('stock_name', '')}
+                    _lvl_icon = {'持有': '🟢 持有', '减仓': '🟡 减仓', '卖出': '🔴 卖出'}
+                    _advice_lines = ["━━━━━━━━━━━━━━━━━━━━",
+                                     f"📅 前{len(_last3)}个选股日推荐 · 操作建议",
+                                     ""]
+                    for _code, _info in _adv_stocks.items():
+                        _a = generate_advice_for_hold(_code, _info['name'])
+                        if _a:
+                            _sig = '；'.join(_a['signals']) if _a['signals'] else '正常'
+                            _tip = _lvl_icon.get(_a['level'], _a['level'])
+                            _stop_s = f"｜止损 {_a['stop']:.2f}" if _a['stop'] else ''
+                            _tgt_s = f"｜止盈参考 {_a['target']:.2f}" if _a['target'] else ''
+                            _advice_lines.append(
+                                f"{_tip} {_code} {_a['name']} | 现价 {_a['current']:.2f} ({_a['pct']:+.1f}%) | {_sig}{_stop_s}{_tgt_s}"
+                            )
+                    if len(_advice_lines) > 3:
+                        _advice_lines.append("")
+                        _lines.append("\n".join(_advice_lines))
+            except Exception as _adv_err:
+                func_logger.warning(f"生成前3天操作建议失败: {_adv_err}")
+
             # ─── 每日大盘复盘 + 新闻 ───
             try:
                 import requests as _req
@@ -1765,8 +1807,11 @@ def run_selection():
                 if not _feishu_enabled:
                     func_logger.info("飞书推送已关闭（enabled=false），跳过")
                 else:
-                    _notifier.send_text(_msg_text)
-                    func_logger.info(f"飞书推送完成，共 {_total} 只股票入选")
+                    _ok = _notifier.send_text(_msg_text)
+                    if _ok:
+                        func_logger.info(f"飞书推送完成，共 {_total} 只股票入选")
+                    else:
+                        func_logger.warning(f"飞书推送未完成（webhook 无效或推送失败）")
                 # 钉钉推送（与飞书并列；未配置或 enabled=false 时跳过）
                 try:
                     from utils.dingtalk_notifier import DingTalkNotifier
@@ -2474,6 +2519,101 @@ def get_selection_history():
             'success': False,
             'error': str(e)
         })
+
+
+@app.route('/api/selection-continuity', methods=['GET'])
+def get_selection_continuity():
+    """
+    统计连续几天选股的差异情况
+
+    参数：
+        days: 统计最近N个选股日（默认5，最大30）
+
+    返回：
+        {
+            'success': True,
+            'dates': [...],              # 选股日期（升序）
+            'daily': [{'date','count','stocks':[{'code','name','strategies'}]}],
+            'continuity': [{'code','name','consecutive_days','appear_days','dates'}],  # 连续>=2天，按连续天数降序
+            'diff': [{'date','count','added':[codes],'removed':[codes]}]
+        }
+    """
+    try:
+        days = int(request.args.get('days', 5))
+        days = max(2, min(days, 30))
+        from utils.global_db import get_global_db
+        db = get_global_db()
+
+        date_rows = db.query("""
+            SELECT DISTINCT selection_date FROM stock_selection_record
+            WHERE is_active = 1 AND selection_date IS NOT NULL
+            ORDER BY selection_date DESC LIMIT ?
+        """, (days,))
+        dates = sorted([r['selection_date'] for r in date_rows])
+        if not dates:
+            return jsonify({'success': True, 'dates': [], 'daily': [], 'continuity': [], 'diff': []})
+
+        daily = []
+        for d in dates:
+            recs = db.query("""
+                SELECT stock_code, stock_name, strategy_name
+                FROM stock_selection_record
+                WHERE selection_date = ? AND is_active = 1
+            """, (d,))
+            stocks = [{'code': r['stock_code'], 'name': r['stock_name'],
+                       'strategies': r.get('strategy_name') or ''} for r in recs]
+            daily.append({'date': d, 'count': len(stocks), 'stocks': stocks})
+
+        # 每只股票在选股日序列中的出现
+        date_index = {d: i for i, d in enumerate(dates)}
+        stock_days = {}
+        for day in daily:
+            for s in day['stocks']:
+                code = s['code']
+                if code not in stock_days:
+                    stock_days[code] = {'name': s['name'], 'idx': []}
+                stock_days[code]['idx'].append(date_index[day['date']])
+
+        # 连续天数（在选股日序列中连续出现的最大长度）
+        continuity = []
+        for code, info in stock_days.items():
+            idxs = sorted(set(info['idx']))
+            max_len = 1
+            cur = 1
+            for i in range(1, len(idxs)):
+                if idxs[i] == idxs[i - 1] + 1:
+                    cur += 1
+                    if cur > max_len:
+                        max_len = cur
+                else:
+                    cur = 1
+            if max_len >= 2:
+                continuity.append({
+                    'code': code,
+                    'name': info['name'],
+                    'consecutive_days': max_len,
+                    'appear_days': len(idxs),
+                    'dates': [dates[i] for i in idxs]
+                })
+        continuity.sort(key=lambda x: (-x['consecutive_days'], -x['appear_days']))
+
+        # 每日差异（相对前一选股日）
+        diff = []
+        for i, day in enumerate(daily):
+            cur_codes = {s['code'] for s in day['stocks']}
+            if i == 0:
+                diff.append({'date': day['date'], 'count': day['count'], 'added': [], 'removed': []})
+            else:
+                prev_codes = {s['code'] for s in daily[i - 1]['stocks']}
+                added = [s['code'] for s in day['stocks'] if s['code'] not in prev_codes]
+                removed = [s['code'] for s in daily[i - 1]['stocks'] if s['code'] not in cur_codes]
+                diff.append({'date': day['date'], 'count': day['count'], 'added': added, 'removed': removed})
+
+        return jsonify({'success': True, 'dates': dates, 'daily': daily,
+                        'continuity': continuity, 'diff': diff})
+    except Exception as e:
+        logger.error(f"统计连续选股失败: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 # ==================== 股票分析相关路由 ====================

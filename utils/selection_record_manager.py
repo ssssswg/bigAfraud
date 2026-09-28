@@ -220,6 +220,19 @@ class SelectionRecordManager:
                     logger.error(f"处理信号失败: {str(e)}")
                     stats['error'] += 1
             
+            # 无有效信号时不清空当天数据，避免误操作
+            if not stock_map:
+                logger.warning(f"选股日期 {selection_date} 无有效信号，跳过保存")
+                return {'success': True, 'saved': 0, 'skipped': 0, 'updated': 0, 'error': 0}
+
+            # 保存前先删除该选股日期当天的旧记录，避免同一天多次选股后数据累积
+            try:
+                delete_sql = "DELETE FROM stock_selection_record WHERE selection_date = ? AND is_active = 1"
+                self.db_manager.execute_with_retry(delete_sql, (selection_date,))
+                logger.info(f"已清理选股日期 {selection_date} 的旧记录，本次整批保存最新选股结果")
+            except Exception as e:
+                logger.warning(f"清理选股日期 {selection_date} 的旧记录失败: {str(e)}")
+
             # 处理每个股票
             for stock_info in stock_map.values():
                 try:

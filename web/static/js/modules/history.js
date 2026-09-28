@@ -302,3 +302,111 @@ export function escapeHtml(text) {
     div.textContent = text;
     return div.innerHTML;
 }
+
+/**
+ * 加载连续选股统计
+ * 统计最近 N 天选股的连续入选与每日差异
+ */
+export async function loadSelectionContinuity() {
+    const daysInput = document.getElementById('continuity-days');
+    const container = document.getElementById('continuity-result');
+    if (!daysInput || !container) return;
+
+    const days = parseInt(daysInput.value) || 5;
+    container.innerHTML = '<p class="loading">正在统计连续选股，请稍候...</p>';
+
+    try {
+        const response = await fetch(`/api/selection-continuity?days=${days}`);
+        const result = await response.json();
+
+        if (!result.success) {
+            container.innerHTML = `<p style="color: #ef4444;">❌ 统计失败: ${result.error || '未知错误'}</p>`;
+            return;
+        }
+        renderContinuity(result, container);
+    } catch (error) {
+        console.error('统计连续选股异常:', error);
+        container.innerHTML = `<p style="color: #ef4444;">❌ 统计异常: ${error.message}</p>`;
+    }
+}
+
+/**
+ * 渲染连续选股统计结果
+ */
+export function renderContinuity(data, container) {
+    const dates = data.dates || [];
+    const continuity = data.continuity || [];
+    const diff = data.diff || [];
+
+    if (dates.length === 0) {
+        container.innerHTML = '<p style="color: #6b7280;">暂无选股数据</p>';
+        return;
+    }
+
+    let html = '';
+
+    // 连续入选重点提醒
+    html += `
+        <div style="margin-bottom: 12px; background: #fffbeb; border-left: 4px solid #f59e0b; padding: 12px; border-radius: 4px;">
+            <strong style="color: #92400e;">🔥 连续入选重点提醒（连续 ≥ 2 天）</strong>
+            <span style="color: #b45309; font-size: 12px; margin-left: 8px;">统计范围：${dates[0]} ~ ${dates[dates.length - 1]}，共 ${dates.length} 个选股日</span>
+        </div>`;
+
+    if (continuity.length === 0) {
+        html += '<p style="color: #6b7280; font-size: 12px; padding: 8px 0;">该范围内没有连续 ≥ 2 天入选的股票</p>';
+    } else {
+        html += `<table class="data-table" style="width: 100%; font-size: 12px; margin-bottom: 20px;">
+            <thead>
+                <tr>
+                    <th>排名</th>
+                    <th>股票代码</th>
+                    <th>股票名称</th>
+                    <th>连续天数</th>
+                    <th>累计入选</th>
+                    <th>入选日期</th>
+                </tr>
+            </thead>
+            <tbody>`;
+        continuity.forEach((item, i) => {
+            const highlight = item.consecutive_days >= 3;
+            html += `
+                <tr style="${highlight ? 'background: #fef3c7; font-weight: 600;' : ''}">
+                    <td>${i + 1}</td>
+                    <td><a href="javascript:void(0)" onclick="viewStockDetail('${escapeHtml(item.code)}')" class="stock-link">${escapeHtml(item.code)}</a></td>
+                    <td>${escapeHtml(item.name)}</td>
+                    <td><span style="background: #f59e0b; color: #fff; padding: 2px 8px; border-radius: 4px; font-weight: 600;">${item.consecutive_days}天</span></td>
+                    <td>${item.appear_days}天</td>
+                    <td>${(item.dates || []).join(', ')}</td>
+                </tr>`;
+        });
+        html += '</tbody></table>';
+    }
+
+    // 每日选股差异
+    html += `
+        <div style="margin-bottom: 10px; font-size: 13px; font-weight: 600; color: #374151;">📅 每日选股差异（相对前一选股日）</div>
+        <table class="data-table" style="width: 100%; font-size: 12px;">
+            <thead>
+                <tr>
+                    <th>选股日期</th>
+                    <th>当日数量</th>
+                    <th>🟢 新增</th>
+                    <th>🔴 去除</th>
+                </tr>
+            </thead>
+            <tbody>`;
+    diff.forEach(row => {
+        const added = (row.added || []).length ? (row.added || []).join(', ') : '-';
+        const removed = (row.removed || []).length ? (row.removed || []).join(', ') : '-';
+        html += `
+            <tr>
+                <td>${row.date}</td>
+                <td>${row.count}</td>
+                <td style="color: #10b981;">${escapeHtml(added)}</td>
+                <td style="color: #ef4444;">${escapeHtml(removed)}</td>
+            </tr>`;
+    });
+    html += '</tbody></table>';
+
+    container.innerHTML = html;
+}

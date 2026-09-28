@@ -776,6 +776,21 @@
                         <!-- 分页 -->
                         <div id="history-pagination" style="display: none; text-align: center; margin-top: 15px; font-size: 12px;">
                         </div>
+
+                        <!-- 连续选股统计 -->
+                        <div style="margin-top: 24px; background: #f9fafb; padding: 15px; border-radius: 6px; border: 1px solid #e5e7eb;">
+                            <div style="font-size: 15px; font-weight: 600; color: #374151; margin-bottom: 12px;">📊 连续选股统计（最近 N 天选股差异）</div>
+                            <div style="display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 15px;">
+                                <div>
+                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">统计天数</label>
+                                    <input type="number" id="continuity-days" value="5" min="2" max="30" style="width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;">
+                                </div>
+                                <button class="btn btn-primary" onclick="loadSelectionContinuity()" style="padding: 6px 12px; font-size: 12px;">🔍 统计连续选股</button>
+                            </div>
+                            <div id="continuity-result">
+                                <p style="color: #6b7280; font-size: 12px;">点击"统计连续选股"查看最近几天的选股连续性与每日差异</p>
+                            </div>
+                        </div>
                     </div>
                 </div>
 
@@ -1969,7 +1984,7 @@
     </div>
 
     <script src="/static/js/dashboard_stats.js"></script>
-    <script type="module" src="/static/js/app.js?v=14"></script>
+    <script type="module" src="/static/js/app.js?v=15"></script>
     <script src="/static/js/kline_chart.js"></script>
     <script src="/static/js/init_simple.js?v=2"></script>
     <script src="/static/js/trading.js"></script>

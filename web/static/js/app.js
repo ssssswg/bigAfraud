@@ -53,7 +53,7 @@ async function loadModules() {
         const selectionModule = await import('./modules/selection.js');
         const analysisModule = await import('./modules/analysis.js');
         const strategiesModule = await import('./modules/strategies.js');
-        const historyModule = await import('./modules/history.js');
+        const historyModule = await import('./modules/history.js?v=15');
         const rankingModule = await import('./modules/ranking.js');
         const utilsModule = await import('./modules/utils.js');
         const backtestModule = await import('./modules/backtest.js');
@@ -143,6 +143,7 @@ async function initializeApp() {
     window.searchSelectionHistory = modules.history.searchSelectionHistory;
     window.goToHistoryPage = modules.history.goToHistoryPage;
     window.resetHistoryFilters = modules.history.resetHistoryFilters;
+    window.loadSelectionContinuity = modules.history.loadSelectionContinuity;
     window.generateRanking = modules.ranking.generateRanking;
     window.trackRanking = modules.ranking.trackRanking;
     window.showScoreDetail = modules.analysis.showScoreDetail;
