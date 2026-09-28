@@ -185,15 +185,46 @@ class DBManager:
         """
         # sql: SQL语句，类型str，必填
         # params: SQL参数，类型tuple，默认空元组
+        # 判断是否为写语句（INSERT/UPDATE/DELETE/REPLACE）
+        is_write = sql.lstrip().upper().startswith(('INSERT', 'UPDATE', 'DELETE', 'REPLACE'))
+
+        # 读语句：直接执行（WAL 下读写不互斥）
+        if not is_write:
+            try:
+                conn = self.connect()
+                cursor = conn.cursor()
+                cursor.execute(sql, params)
+                # 移除高频debug日志，避免日志轮转导致的权限问题
+                return cursor
+            except sqlite3.Error as e:
+                logger.error(f"SQL执行失败: {sql[:100]} - {str(e)}")
+                raise
+
+        # 写语句：串行化写者（复用全局写锁，事务内已持锁则不重复获取）+ 锁冲突自动退避重试
+        acquired = not self._has_write_lock
+        if acquired:
+            self._write_lock.acquire()
         try:
-            conn = self.connect()
-            cursor = conn.cursor()
-            cursor.execute(sql, params)
-            # 移除高频debug日志，避免日志轮转导致的权限问题
-            return cursor
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    conn = self.connect()
+                    cursor = conn.cursor()
+                    cursor.execute(sql, params)
+                    return cursor
+                except sqlite3.OperationalError as e:
+                    if 'database is locked' in str(e) and attempt < max_retries - 1:
+                        wait_time = 0.5 * (2 ** attempt)
+                        logger.warning(f"数据库被锁定，{wait_time}秒后重试（第{attempt + 1}次）")
+                        time.sleep(wait_time)
+                        continue
+                    raise
         except sqlite3.Error as e:
             logger.error(f"SQL执行失败: {sql[:100]} - {str(e)}")
             raise
+        finally:
+            if acquired:
+                self._write_lock.release()
     
     def execute_with_retry(self, sql: str, params: Tuple = (), max_retries: int = 3) -> sqlite3.Cursor:
         """

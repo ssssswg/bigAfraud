@@ -1,5 +1,6 @@
 import sqlite3
 import logging
+import json
 from datetime import datetime
 from typing import List, Dict, Optional
 from utils.selection_record_manager import SelectionRecordManager
@@ -331,73 +332,119 @@ class RankingManager:
             logger.warning(f"获取股票 {stock_code} 板块信息失败: {str(e)}")
             return ''
     
-    def track_ranking(self, selection_date: str, top_n: int = 5) -> List[Dict]:
+    def track_ranking(self, selection_date: str, top_n: int = 5, sort_by: str = 'yield') -> List[Dict]:
         """跟踪指定日期的排名
-        
+
         Args:
             selection_date: 选股日期，格式为YYYY-MM-DD
             top_n: 返回前N条记录
-            
+            sort_by: 排序字段，'yield'（默认，按收益率降序）或 'strategy'（按入选策略名称，相同策略排一起）
+
         Returns:
             排名跟踪结果列表
         """
         try:
-            # 1. 获取指定日期的排名记录，按分数降序排序
+            # 1. 获取指定日期的全部有效记录（含策略名与关键日期说明）
             sql = """
-                SELECT id, stock_code, stock_name, industry, sector, selection_price, score, rank_position 
+                SELECT id, stock_code, stock_name, industry, sector, selection_price, score, rank_position,
+                       strategy_name, key_dates
                 FROM stock_selection_record 
                 WHERE selection_date = ? AND is_active = 1 
                 AND score IS NOT NULL 
-                ORDER BY score DESC 
-                LIMIT ?
+                ORDER BY score DESC
             """
-            records = self.db_manager.query(sql, (selection_date, top_n))
-            
+            records = self.db_manager.query(sql, (selection_date,))
+            if not records:
+                return []
+
+            # 评分排名：该日全部记录按 score 降序的名次（同分同名次）
+            score_sorted = sorted(records, key=lambda r: r['score'] or 0, reverse=True)
+            score_rank_map = {}
+            prev = None
+            cur_rank = 0
+            for r in score_sorted:
+                s = r['score'] or 0
+                if s != prev:
+                    cur_rank += 1
+                    prev = s
+                score_rank_map[r['stock_code']] = cur_rank
+
             # 2. 计算实时数据
             tracking_results = []
-            for i, record in enumerate(records, 1):
+            for record in records:
                 stock_code = record['stock_code']
                 stock_name = record['stock_name']
                 industry = record['industry']
                 sector = record['sector']
                 selection_price = record['selection_price']
                 score = record['score']
-                
+
                 # 获取实时价格
                 current_price = self.akshare_fetcher.get_stock_price(stock_code)
-                
+
                 # 计算当前收益率
                 current_yield = 0.0
                 if current_price and selection_price:
                     current_yield = (current_price - selection_price) / selection_price * 100
-                
+
                 # 获取选入后最高价格
                 highest_price = self._get_highest_price(stock_code, selection_date)
-                
+
                 # 计算最高收益率
                 highest_yield = 0.0
                 if highest_price and selection_price:
                     highest_yield = (highest_price - selection_price) / selection_price * 100
-                
+
                 tracking_results.append({
-                    'rank_position': i,  # 使用按分数排序后的新排名
+                    'rank_position': 0,  # 收益率排序后重编号
                     'stock_code': stock_code,
                     'stock_name': stock_name,
                     'score': score,
+                    'score_rank': score_rank_map.get(stock_code, 0),
                     'industry': industry,
                     'sector': sector,
                     'selection_price': selection_price,
                     'current_price': current_price,
                     'current_yield': round(current_yield, 2),
                     'highest_price': highest_price,
-                    'highest_yield': round(highest_yield, 2)
+                    'highest_yield': round(highest_yield, 2),
+                    'strategies': self._format_strategies(record.get('strategy_name'), record.get('key_dates'))
                 })
-            
-            return tracking_results
+
+            # 3. 排序：默认按收益率降序；可选按入选策略名称（相同策略排一起，组内收益率降序；空策略排最后）
+            if sort_by == 'strategy':
+                tracking_results.sort(key=lambda x: (x['strategies'] or '\U0010FFFF', -x['current_yield']))
+            else:
+                tracking_results.sort(key=lambda x: x['current_yield'], reverse=True)
+            for i, item in enumerate(tracking_results, 1):
+                item['rank_position'] = i
+
+            return tracking_results[:top_n]
         except Exception as e:
             logger.error(f"跟踪排名失败: {str(e)}")
             return []
-    
+
+    def _format_strategies(self, strategy_name: Optional[str], key_dates: Optional[str]) -> str:
+        """格式化入选策略及关键日期说明"""
+        parts = []
+        if strategy_name:
+            parts.append(strategy_name)
+        if key_dates:
+            try:
+                kd = json.loads(key_dates) if isinstance(key_dates, str) else key_dates
+                if isinstance(kd, list):
+                    for item in kd:
+                        if not isinstance(item, dict):
+                            continue
+                        desc = item.get('type') or item.get('description') or ''
+                        d = (item.get('date') or '')[:10]
+                        seg = f"{desc} {d}".strip()
+                        if seg:
+                            parts.append(seg)
+            except Exception:
+                pass
+        return '；'.join(parts) if parts else ''
+
     def _get_highest_price(self, stock_code: str, selection_date: str) -> float:
         """获取选入后的最高价格
         

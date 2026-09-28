@@ -94,6 +94,7 @@ export async function generateRanking() {
 export async function trackRanking() {
     const dateInput = document.getElementById('ranking-track-date');
     const topNSelect = document.getElementById('ranking-track-topn');
+    const sortSelect = document.getElementById('ranking-track-sort');
     const resultContainer = document.getElementById('ranking-track-result');
     
     if (!dateInput || !topNSelect || !resultContainer) return;
@@ -110,7 +111,8 @@ export async function trackRanking() {
     resultContainer.innerHTML = '<p class="loading">正在跟踪排名，请稍候...</p>';
     
     try {
-        const response = await fetch(`/api/ranking/track?selection_date=${selectionDate}&top_n=${topN}`);
+        const sortBy = sortSelect ? sortSelect.value : 'yield';
+        const response = await fetch(`/api/ranking/track?selection_date=${selectionDate}&top_n=${topN}&sort_by=${sortBy}`);
         const result = await response.json();
         
         if (result.success) {
@@ -199,13 +201,14 @@ export function renderTrackingResult(data, container, selectionDate) {
                         <th>股票代码</th>
                         <th>股票名称</th>
                         <th>评分</th>
+                        <th>评分排名</th>
                         <th>行业</th>
-                        <th>板块</th>
                         <th>选入价</th>
                         <th>当前价</th>
                         <th>收益率</th>
                         <th>最高价格</th>
                         <th>最高收益</th>
+                        <th>入选策略及说明</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -242,13 +245,14 @@ export function renderTrackingResult(data, container, selectionDate) {
                 <td><a href="javascript:void(0)" onclick="viewStockDetail('${item.stock_code}')" class="stock-link">${item.stock_code}</a></td>
                 <td>${item.stock_name}</td>
                 <td><a href="javascript:void(0)" onclick="showScoreDetail('${item.stock_code}', '${selectionDate}')" class="score-link">${score.toFixed(2)}</a></td>
+                <td>${item.score_rank || '-'}</td>
                 <td>${item.industry || '-'}</td>
-                <td>${item.sector || '-'}</td>
                 <td>¥${selectionPrice.toFixed(2)}</td>
                 <td>¥${currentPrice.toFixed(2)}</td>
                 <td class="${currentReturn >= 0 ? 'text-success' : 'text-danger'}">${currentReturn.toFixed(2)}%</td>
                 <td>¥${highestPrice.toFixed(2)}</td>
                 <td class="${highestReturn >= 0 ? 'text-success' : 'text-danger'}">${highestReturn.toFixed(2)}%</td>
+                <td style="max-width: 280px; font-size: 12px;">${item.strategies || '-'}</td>
             </tr>
         `;
     });

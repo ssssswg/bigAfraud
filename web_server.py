@@ -3395,7 +3395,8 @@ def track_ranking():
                 'message': '缺少选股日期参数'
             })
         
-        results = ranking_manager.track_ranking(selection_date, top_n)
+        sort_by = request.args.get('sort_by', 'yield')
+        results = ranking_manager.track_ranking(selection_date, top_n, sort_by)
         # 清理数据，确保可以正确序列化为JSON
         cleaned_results = clean_data_for_json(results)
         

@@ -130,3 +130,29 @@
 - **排查**：保存日志显示"保存:0 更新:17 错误:0"（**保存成功**），但数据库记录 `selection_date=2026-09-24`（selection_time=09-27 17:55:09）——`save_selection` 的 `_get_nearest_kline_date` 把执行日 09-27 映射到最近交易日 **09-24**（因周末），记录归档到 09-24，历史选股按 09-26~27 查不到。
 - **修复**：`utils/selection_record_manager.py` 保存选股时改为**按执行选股的自然日归档**（`selection_date = user_date`，不做交易日映射；周末/节假日保存当天日期），`selection_time` 仍记录真实执行时间。历史选股按执行当天即可查询。
 - **验证**：改后 end_date=2026-09-27 -> selection_date=2026-09-27（不再映射 09-24）；日期段不再调用 `_get_nearest_kline_date`。编译通过，**需重启服务生效**；重新执行选股并保存后，当天结果将落在执行日。
+
+---
+
+## v5 ｜ 2026-09-28 · SQLite 并发写锁修复
+
+### 修复：批量回测保存 `database is locked`（SQLite 并发写冲突）
+- **现象**：批量回测保存 `backtest_result` / 收益曲线时，`db_manager` 反复报 `sqlite3.OperationalError: database is locked`（`db_manager.py:195` / `backtest_dao.py:253`），保存失败。
+- **根因**：db_manager 的全局写锁 `_write_lock` 只在事务路径（`begin_transaction`）获取；`insert` / `update` / `delete` / `insert_many` 等非事务写直接 `execute`，**无锁串行化、无锁冲突重试** → 并发写（如回测保存与其他写库）在 WAL 模式下写者互斥，撞锁即抛错。
+- **修复**：`utils/db_manager.py` 的 `execute()` 对写语句（INSERT / UPDATE / DELETE / REPLACE）统一走**全局写锁串行化**（事务内已持锁则不重复获取）+ **锁冲突指数退避重试**（0.5s / 1s / 2s，最多 3 次），覆盖所有写路径；读语句不受影响。
+- **验证**：临时库 4 线程并发写 → 0 报错、200 行全部入库；`py_compile` 通过。
+
+---
+
+## v6 ｜ 2026-09-28 · 排名跟踪页改造
+
+### 功能：排名跟踪按收益率降序 + 列结构调整
+- **现象**：排名跟踪表格按评分降序展示（均胜电子 61.30 / 继峰 57.80 / 宿迁 57.00），且行业、板块两列内容重复；缺少"评分排名"与"入选策略及说明"。
+- **改动**：
+  1. `utils/ranking_manager.py` `track_ranking`：查询该日全部有效记录（去掉 SQL `LIMIT`），逐条算实时收益率后**按 `current_yield` 降序**取 `top_n`，`rank_position` 重编号；新增 `score_rank`（该日按 `score` 降序的名次，同分同名次）与 `strategies`（`strategy_name` + `key_dates` JSON 中 type/date 的拼接说明，date 截断到 YYYY-MM-DD）。
+  2. `web/static/js/modules/ranking.js` `renderTrackingResult`：**删除"板块"列**（保留"行业"），新增**"评分排名"**与**"入选策略及说明"**两列；行渲染对应读取 `score_rank` / `strategies`。
+- **验证**：`py_compile` 通过；实测 `track_ranking('2026-09-28', 17)` 返回 17 条、收益率降序 `[10.02, 3.4, 2.08, ...]`、`score_rank` 正确（均胜电子 61.3 → 1）、`strategies` 形如"趋势起点策略；趋势起点确认日 2026-09-24"；前端 node --check 通过。**需重启服务 + 刷新浏览器生效**。
+
+### 功能：排名跟踪可选排序字段（按收益率 / 按入选策略名称）
+- **现象**：排名跟踪仅按收益率降序固定排序，无法按策略归类查看。
+- **改动**：排名跟踪页新增**排序字段下拉**（`web/templates/index.html`，默认"收益率（默认）"，可切换"入选策略名称"）；`ranking.js` `trackRanking` 读取 `ranking-track-sort` 并随请求传 `sort_by`；`ranking_manager.track_ranking` 新增 `sort_by` 参数——`'yield'`（默认，按收益率降序）/ `'strategy'`（按 `strategies` 名称排序、相同策略排一起、组内收益率降序、空策略排最后）；`web_server.py` `/api/ranking/track` 透传 `sort_by`。
+- **验证**：`py_compile` 通过；实测 `track_ranking('2026-09-28', 17, 'strategy')` 相同策略连续排列、组内收益率降序 OK；`sort_by='yield'` 仍按收益率降序；前端 node --check 通过。**需重启服务 + 刷新浏览器生效**。
