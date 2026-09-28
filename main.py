@@ -641,8 +641,8 @@ B1完美图形匹配:
     parser.add_argument(
         '--port',
         type=int,
-        default=5000,
-        help='Web服务器端口 (默认: 5000)'
+        default=8888,
+        help='Web服务器端口 (默认: 8888)'
     )
     
     parser.add_argument(
