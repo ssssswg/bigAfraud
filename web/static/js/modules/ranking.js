@@ -149,6 +149,9 @@ export function renderRankingResult(data, container, selectionDate) {
                         <th>行业</th>
                         <th>板块</th>
                         <th>选入价</th>
+                        <th>止盈/止损建议</th>
+                        <th>卖出原因</th>
+                        <th>卖出后收益</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -168,6 +171,12 @@ export function renderRankingResult(data, container, selectionDate) {
                 <td>${item.industry || '-'}</td>
                 <td>${item.sector || '-'}</td>
                 <td>¥${selectionPrice.toFixed(2)}</td>
+                <td>
+                    ${item.sell_status === '卖出' ? '🔴 建议卖出' : '🟢 持有'}
+                    ${item.sell_price ? ' @ ¥' + Number(item.sell_price).toFixed(2) : (item.sell_status === '卖出' ? '（次日开盘）' : '')}
+                </td>
+                <td style="font-size: 12px; max-width: 180px;">${item.sell_reason || '-'}</td>
+                <td class="${(item.sell_yield !== null && item.sell_yield !== undefined ? item.sell_yield : -1) >= 0 ? 'text-success' : 'text-danger'}">${item.sell_yield !== null && item.sell_yield !== undefined ? Number(item.sell_yield).toFixed(2) + '%' : '待次日收盘'}</td>
             </tr>
         `;
     });

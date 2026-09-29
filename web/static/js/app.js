@@ -54,7 +54,7 @@ async function loadModules() {
         const analysisModule = await import('./modules/analysis.js');
         const strategiesModule = await import('./modules/strategies.js');
         const historyModule = await import('./modules/history.js?v=15');
-        const rankingModule = await import('./modules/ranking.js');
+        const rankingModule = await import('./modules/ranking.js?v=19');
         const utilsModule = await import('./modules/utils.js');
         const backtestModule = await import('./modules/backtest.js');
         const backtestBatchModule = await import('./modules/backtest-batch.js');

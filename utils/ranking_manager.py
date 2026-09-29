@@ -157,16 +157,26 @@ class RankingManager:
         """
         existing_records = self.db_manager.query(existing_sql, (selection_date,))
         
-        return [{
-            'id': record['id'],
-            'stock_code': record['stock_code'],
-            'stock_name': record['stock_name'],
-            'industry': record['industry'],
-            'sector': record['sector'],
-            'selection_price': record['selection_price'],
-            'score': record['score'],
-            'rank_position': record['rank_position']
-        } for record in existing_records]
+        results = []
+        for record in existing_records:
+            sell = self._compute_sell_advice(
+                record['stock_code'], record['selection_price'], selection_date
+            )
+            results.append({
+                'id': record['id'],
+                'stock_code': record['stock_code'],
+                'stock_name': record['stock_name'],
+                'industry': record['industry'],
+                'sector': record['sector'],
+                'selection_price': record['selection_price'],
+                'score': record['score'],
+                'rank_position': record['rank_position'],
+                'sell_price': sell['sell_price'] if sell else None,
+                'sell_reason': sell['sell_reason'] if sell else '',
+                'sell_yield': sell['sell_yield'] if sell else 0,
+                'sell_status': sell['sell_status'] if sell else '持有',
+            })
+        return results
     
     def _batch_get_strategy_counts(self, stock_codes: List[str], selection_date: str) -> Dict[str, int]:
         """批量查询股票的策略命中数"""
@@ -332,6 +342,110 @@ class RankingManager:
             logger.warning(f"获取股票 {stock_code} 板块信息失败: {str(e)}")
             return ''
     
+    def _compute_sell_advice(self, stock_code: str, selection_price: float, selection_date: str) -> Optional[Dict]:
+        """逆人性卖出信号：从选股日到最新交易日逐日扫描，返回卖点/原因/收益
+
+        卖出价口径：盘后确认信号 → 次日开盘价卖出（可执行）；信号在最新交易日触发时先给出卖出建议，具体收益率待次日收盘后回填。
+
+        逆人性逻辑（与散户相反）：
+          - 散户破位死扛 → 我们跌破MA5(该强不强)/MA10 即止损卖出
+          - 散户放量滞涨舍不得卖 → 量>1.5倍5日均量且滞涨 即卖出(出货)
+          - 散户高位贪婪追涨 → 偏离月线>10% / 触布林上轨 即止盈卖出(兑现)
+          - 强者恒强豁免：强势创新高(MA5>MA10多头且逼近近10日高点)时不因位置高卖出
+          - 健康上涨豁免：量价齐升(涨幅>0且放量) + 温和放量(量>5日均量且≤3倍) + MACD无顶背离 → 放量滞涨/高位止盈不触发，继续持有（跌破均线的破位信号除外）
+        """
+        try:
+            import pandas as pd
+            df = self.db_manager.read_stock(stock_code)
+            if df is None or df.empty or not selection_price:
+                return None
+            if 'date' not in df.columns:
+                df = df.reset_index()
+            df['date'] = pd.to_datetime(df['date'])
+            df = df.sort_values('date').reset_index(drop=True)
+            rows = df.to_dict('records')
+            closes = [float(r['close']) for r in rows]
+            opens = [float(r['open']) for r in rows]
+            highs = [float(r['high']) for r in rows]
+            vols = [float(r.get('volume') or 0) for r in rows]
+            # MACD 预计算（12/26/9），用于顶背离判定
+            _s = pd.Series(closes)
+            _ema_fast = _s.ewm(span=12, adjust=False).mean()
+            _ema_slow = _s.ewm(span=26, adjust=False).mean()
+            dif_arr = (_ema_fast - _ema_slow).tolist()
+            dea_arr = (_ema_fast - _ema_slow).ewm(span=9, adjust=False).mean().tolist()
+            sd = pd.to_datetime(selection_date)
+            # 选股日之后起始索引
+            start = None
+            for k, r in enumerate(rows):
+                if r['date'] > sd:
+                    start = k
+                    break
+            if start is None or start + 9 >= len(rows):
+                # K线不足10根，退化为当前价持有
+                last = closes[-1]
+                return {'sell_price': round(last, 2), 'sell_reason': '数据不足，持有',
+                        'sell_yield': round((last - selection_price) / selection_price * 100, 2),
+                        'sell_status': '持有'}
+            last_high_price = -float('inf')
+            last_high_dif = -float('inf')
+            for i in range(start, len(rows)):
+                ma5 = sum(closes[i-4:i+1]) / 5 if i >= 4 else None
+                ma10 = sum(closes[i-9:i+1]) / 10 if i >= 9 else None
+                ma20 = sum(closes[i-19:i+1]) / 20 if i >= 19 else None
+                std20 = None
+                if i >= 19:
+                    w = closes[i-19:i+1]
+                    m = sum(w) / len(w)
+                    std20 = (sum((x - m) ** 2 for x in w) / len(w)) ** 0.5
+                prev = closes[i-1]
+                pct = (closes[i] - prev) / prev * 100 if prev else 0
+                vol5 = sum(vols[max(0, i-5):i]) / min(5, i) if i >= 5 else None
+                vol_expand = bool(vol5) and vols[i] > vol5 * 1.5
+                near_high = max(highs[max(0, i-9):i+1])
+                strong = ma5 and ma10 and ma5 > ma10 and closes[i] >= near_high * 0.98
+                # 健康上涨（继续持有）：量价齐升 + 温和放量 + MACD无顶背离
+                price_up = pct > 0
+                vol_up = (i > 0) and vols[i] > vols[i-1]
+                moderate_vol = bool(vol5) and vols[i] > vol5 and vols[i] <= vol5 * 3.0
+                top_div = False
+                if closes[i] > last_high_price:
+                    if dif_arr[i] < last_high_dif - 1e-9:
+                        top_div = True
+                    last_high_price = closes[i]
+                    last_high_dif = dif_arr[i]
+                healthy = price_up and vol_up and moderate_vol and (not top_div)
+                # 信号判定
+                reason = None
+                if ma10 and closes[i] < ma5 and closes[i] < ma10:
+                    reason = '跌破5/10日线(该强不强)'
+                elif ma5 and closes[i] < ma5:
+                    reason = '跌破5日线(该强不强)'
+                elif vol_expand and pct < 2 and not healthy:
+                    reason = '放量滞涨(出货信号)'
+                elif ma20 and (closes[i] > ma20 * 1.10 or (std20 and closes[i] > ma20 + 2 * std20)) and not strong and not healthy:
+                    reason = '高位止盈(偏离月线>10%)'
+                if reason:
+                    # 盘后确认信号 → 次日开盘价卖出（可执行口径）
+                    if i + 1 < len(rows):
+                        sell = opens[i + 1]
+                        return {'sell_price': round(sell, 2), 'sell_reason': reason,
+                                'sell_yield': round((sell - selection_price) / selection_price * 100, 2),
+                                'sell_status': '卖出'}
+                    # 信号在最新交易日触发：卖出建议提前给出，收益率待次日收盘后回填
+                    return {'sell_price': None,
+                            'sell_reason': f'{reason}（次日开盘卖出，收益待收盘后计算）',
+                            'sell_yield': None,
+                            'sell_status': '卖出'}
+            # 未触发 → 持有
+            last = closes[-1]
+            return {'sell_price': round(last, 2), 'sell_reason': '持有中',
+                    'sell_yield': round((last - selection_price) / selection_price * 100, 2),
+                    'sell_status': '持有'}
+        except Exception as e:
+            logger.warning(f"计算卖出建议失败 {stock_code}: {e}")
+            return None
+
     def track_ranking(self, selection_date: str, top_n: int = 5, sort_by: str = 'yield') -> List[Dict]:
         """跟踪指定日期的排名
 
