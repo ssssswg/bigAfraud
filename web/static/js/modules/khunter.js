@@ -881,9 +881,9 @@ export function renderKHunterTrackingResult(data, container, huntingDate) {
                 <td>${item.sector || '-'}</td>
                 <td>¥${selectionPrice.toFixed(2)}</td>
                 <td>¥${currentPrice.toFixed(2)}</td>
-                <td class="${currentReturn >= 0 ? 'text-success' : 'text-danger'}">${currentReturn.toFixed(2)}%</td>
+                <td class="${currentReturn >= 0 ? 'text-danger' : 'text-success'}">${currentReturn.toFixed(2)}%</td>
                 <td>¥${highestPrice.toFixed(2)}</td>
-                <td class="${highestReturn >= 0 ? 'text-success' : 'text-danger'}">${highestReturn.toFixed(2)}%</td>
+                <td class="${highestReturn >= 0 ? 'text-danger' : 'text-success'}">${highestReturn.toFixed(2)}%</td>
             </tr>
         `;
     });

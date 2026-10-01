@@ -24,7 +24,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 from strategy.base_strategy import BaseStrategy
-from utils.technical import MA, MACD, RSI
+from utils.technical import ma_norm, MACD, RSI
 
 
 class TrendResonanceReversalStrategy(BaseStrategy):
@@ -75,8 +75,8 @@ class TrendResonanceReversalStrategy(BaseStrategy):
         result['rsi'] = rsi_df['rsi']
         
         # 计算均线
-        result['ma_short'] = MA(result['close'], self.params['short_ma_period'])
-        result['ma_long'] = MA(result['close'], self.params['long_ma_period'])
+        result['ma_short'] = ma_norm(result, self.params['short_ma_period'])
+        result['ma_long'] = ma_norm(result, self.params['long_ma_period'])
         
         # 计算MACD指标
         macd_df = MACD(result, 

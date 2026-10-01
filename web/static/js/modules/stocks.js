@@ -245,33 +245,41 @@ export async function loadHotAreas() {
 }
 
 /**
- * 加载股票列表 - 支持分页获取所有股票
+ * 股票列表分页状态
  */
-export async function loadStocks() {
+let stocksState = { page: 1, per_page: 100, total: 0, total_pages: 1, keyword: '' };
+
+/**
+ * 加载股票列表（服务端分页 + 关键词模糊查询）
+ * @param {number} page - 页码
+ * @param {string} keyword - 搜索关键词（代码/名称）
+ */
+export async function loadStocks(page = 1, keyword = '') {
     const tbody = document.getElementById('stocks-tbody');
     tbody.innerHTML = '<tr><td colspan="7" class="loading">正在加载股票列表...</td></tr>';
-    
+
+    stocksState.page = Math.max(1, page);
+    stocksState.keyword = keyword || '';
+    bindStockSearch();
+
     try {
-        let allStocks = [];
-        let page = 1;
-        let totalPages = 1;
-        
-        // 分页获取所有股票
-        do {
-            const response = await fetch(`/api/stocks?page=${page}&per_page=500`);
-            const result = await response.json();
-            
-            if (result.success) {
-                allStocks = allStocks.concat(result.data);
-                totalPages = result.total_pages;
-                tbody.innerHTML = `<tr><td colspan="7" class="loading">已加载 ${allStocks.length} / ${result.total} 只股票...</td></tr>`;
-                page++;
-            } else {
-                break;
-            }
-        } while (page <= totalPages);
-        
-        renderStocks(allStocks);
+        const params = new URLSearchParams({
+            page: stocksState.page,
+            per_page: stocksState.per_page,
+            keyword: stocksState.keyword
+        });
+        const response = await fetch(`/api/stocks?${params.toString()}`);
+        const result = await response.json();
+
+        if (!result.success) {
+            tbody.innerHTML = `<tr><td colspan="7" class="loading">加载失败: ${result.error || ''}</td></tr>`;
+            return;
+        }
+
+        stocksState.total = result.total || 0;
+        stocksState.total_pages = result.total_pages || 1;
+        renderStocks(result.data || []);
+        renderStocksPagination();
     } catch (error) {
         tbody.innerHTML = `<tr><td colspan="7" class="loading">加载失败: ${error.message}</td></tr>`;
     }
@@ -304,15 +312,63 @@ export function renderStocks(stocks) {
             </td>
         </tr>
     `).join('');
-    
-    // 搜索功能
-    document.getElementById('stock-search').addEventListener('input', (e) => {
-        const keyword = e.target.value.toLowerCase();
-        const rows = tbody.querySelectorAll('tr');
-        rows.forEach(row => {
-            const text = row.textContent.toLowerCase();
-            row.style.display = text.includes(keyword) ? '' : 'none';
-        });
+}
+
+/**
+ * 渲染分页控件
+ */
+function renderStocksPagination() {
+    const container = document.getElementById('stocks-pagination');
+    if (!container) return;
+
+    const { page, per_page, total, total_pages } = stocksState;
+    if (total_pages <= 1) {
+        container.style.display = 'none';
+        return;
+    }
+    container.style.display = 'flex';
+
+    const btn = (label, pg, disabled, active) =>
+        `<button class="btn ${active ? 'btn-primary' : 'btn-secondary'}" ${disabled ? 'disabled' : ''} onclick="window.goStocksPage(${pg})">${label}</button>`;
+
+    const maxShown = 5;
+    let start = Math.max(1, page - Math.floor(maxShown / 2));
+    let end = Math.min(total_pages, start + maxShown - 1);
+    start = Math.max(1, end - maxShown + 1);
+    let pages = '';
+    for (let i = start; i <= end; i++) {
+        pages += btn(i, i, false, i === page);
+    }
+
+    container.innerHTML = `
+        <span style="font-size:12px; color:#6b7280;">共 ${total} 只 · 第 ${page}/${total_pages} 页</span>
+        ${btn('上一页', page - 1, page <= 1, false)}
+        ${pages}
+        ${btn('下一页', page + 1, page >= total_pages, false)}
+        <select id="stocks-per-page" onchange="window.goStocksPerPage(this.value)" style="font-size:12px; padding:2px 4px; margin-left:8px;">
+            ${[50, 100, 200, 500].map(n => `<option value="${n}" ${n === per_page ? 'selected' : ''}>每页${n}条</option>`).join('')}
+        </select>
+    `;
+}
+
+// 全局翻页 / 改每页条数（供 index.html onclick 调用）
+window.goStocksPage = (pg) => loadStocks(pg, stocksState.keyword);
+window.goStocksPerPage = (per) => {
+    stocksState.per_page = parseInt(per, 10) || 100;
+    loadStocks(1, stocksState.keyword);
+};
+
+/**
+ * 绑定搜索框（防抖，幂等——只绑定一次）
+ */
+function bindStockSearch() {
+    const input = document.getElementById('stock-search');
+    if (!input || input.dataset.stockSearchBound) return;
+    input.dataset.stockSearchBound = '1';
+    let timer = null;
+    input.addEventListener('input', (e) => {
+        clearTimeout(timer);
+        timer = setTimeout(() => loadStocks(1, e.target.value.trim()), 300);
     });
 }
 
@@ -348,17 +404,28 @@ export function showStockModal(code, data) {
     const chartContainer = document.getElementById('stock-chart-container');
     chartContainer.style.display = 'block';
     
-    // 清空股票信息区域，只显示K线图表
-    document.getElementById('stock-info').innerHTML = '';
+    // 清空并隐藏股票信息区域，只显示K线图表（避免空容器抢占K线宽度）
+    const infoEl = document.getElementById('stock-info');
+    if (infoEl) {
+        infoEl.innerHTML = '';
+        infoEl.style.display = 'none';
+    }
+    
+    // 显示涨跌幅列表
+    const changeList = document.getElementById('stock-change-list');
+    if (changeList) changeList.style.display = 'block';
     
     // 先显示模态框，让容器获得正确的尺寸
     modal.classList.add('active');
     
     // 使用requestAnimationFrame确保DOM已更新，容器有正确的宽度
     requestAnimationFrame(() => {
-        // 初始化K线图表
+        // 初始化K线图表（默认展示最近约2个月，约40个交易日，更聚焦近期）
         // 注意：使用stock-chart-container而不是stock-chart（canvas元素）
-        initKlineChart('stock-chart-container', data);
+        const recent = (Array.isArray(data) && data.length > 480) ? data.slice(-480) : data;
+        initKlineChart('stock-chart-container', recent);
+        // 填充每日涨跌幅列表（与K线一致，近2个月）
+        fillStockChangeList(recent);
     });
 }
 
@@ -446,6 +513,34 @@ export async function showAreaStocks(area, limit = 50) {
  * @param {Array} stocks - 股票列表数据
  * @param {string} date - 评分日期
  */
+export function fillStockChangeList(data) {
+    const el = document.getElementById('stock-change-list');
+    if (!el || !data) return;
+    const arr = (Array.isArray(data) ? data : []).filter(d => d && d.close);
+    let rows = '';
+    for (let i = arr.length - 1; i >= 0; i--) {
+        const d = arr[i];
+        const prevC = i > 0 ? arr[i - 1].close : null;
+        const chg = prevC ? (Number(d.close) - Number(prevC)) / Number(prevC) * 100 : null;
+        const color = (chg !== null && chg >= 0) ? '#ef4444' : '#10b981';
+        const date = String(d.date || '').slice(0, 10);
+        const close = Number(d.close).toFixed(2);
+        const chgTxt = (chg === null || chg === undefined)
+            ? '--'
+            : (chg > 0 ? '+' : '') + chg.toFixed(2) + '%';
+        rows += `<tr>
+            <td>${date}</td>
+            <td>${close}</td>
+            <td style="color:${color};font-weight:600;">${chgTxt}</td>
+        </tr>`;
+    }
+    el.innerHTML = `<div class="scl-title">每日涨跌幅</div>
+        <table class="scl-table">
+            <thead><tr><th>日期</th><th>收盘</th><th>涨跌幅</th></tr></thead>
+            <tbody>${rows}</tbody>
+        </table>`;
+}
+
 export function showStocksModal(title, stocks, date) {
     const modal = document.getElementById('stock-modal');
     document.getElementById('stock-detail-modal-title').textContent = title;
@@ -454,8 +549,13 @@ export function showStocksModal(title, stocks, date) {
     const chartContainer = document.getElementById('stock-chart-container');
     chartContainer.style.display = 'none';
     
-    // 清空股票信息区域
+    // 隐藏涨跌幅列表
+    const changeList = document.getElementById('stock-change-list');
+    if (changeList) changeList.style.display = 'none';
+    
+    // 恢复并清空股票信息区域（供股票列表弹窗使用）
     const stockInfo = document.getElementById('stock-info');
+    stockInfo.style.display = 'block';
     stockInfo.innerHTML = '';
     
     if (stocks.length === 0) {
@@ -505,9 +605,9 @@ export function showStocksModal(title, stocks, date) {
                 <td>${item.sector || '-'}</td>
                 <td>¥${selectionPrice.toFixed(2)}</td>
                 <td>¥${currentPrice.toFixed(2)}</td>
-                <td class="${currentReturn >= 0 ? 'text-success' : 'text-danger'}">${currentReturn.toFixed(2)}%</td>
+                <td class="${currentReturn >= 0 ? 'text-danger' : 'text-success'}">${currentReturn.toFixed(2)}%</td>
                 <td>¥${highestPrice.toFixed(2)}</td>
-                <td class="${highestReturn >= 0 ? 'text-success' : 'text-danger'}">${highestReturn.toFixed(2)}%</td>
+                <td class="${highestReturn >= 0 ? 'text-danger' : 'text-success'}">${highestReturn.toFixed(2)}%</td>
             </tr>
         `;
     });

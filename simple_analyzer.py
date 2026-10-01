@@ -1,41 +1,8 @@
 """
 简单买入建议分析模块
 基于技术指标给股票打分，提供买入建议
+数据源统一为本地核心库K线（utils.db_manager / utils.price_levels），不依赖外部行情接口。
 """
-import requests
-import json
-
-
-def get_stock_kline(code):
-    """获取股票K线数据"""
-    try:
-        # 判断市场
-        if code.startswith("6") or code.startswith("88"):
-            market = "sh"
-        else:
-            market = "sz"
-        
-        url = f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={market}{code},day,,,60,qfq"
-        resp = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0"})
-        data = resp.json()
-        
-        klines = []
-        stock_data = data.get("data", {}).get(f"{market}{code}", {})
-        day_data = stock_data.get("qfqday") or stock_data.get("day", [])
-        
-        for item in day_data:
-            if len(item) >= 6:
-                klines.append({
-                    "date": item[0],
-                    "open": float(item[1]),
-                    "close": float(item[2]),
-                    "high": float(item[3]),
-                    "low": float(item[4]),
-                    "volume": float(item[5])
-                })
-        return klines
-    except Exception:
-        return []
 
 
 def calculate_ma(klines, period):
@@ -100,11 +67,20 @@ def calculate_macd(klines):
 
 
 def analyze_stock(code, name):
-    """分析单只股票，返回评分和建议"""
-    klines = get_stock_kline(code)
-    
-    if not klines or len(klines) < 20:
+    """分析单只股票，返回评分和建议（数据源：本地核心库K线）"""
+    try:
+        from utils.global_db import get_global_db
+        from utils.price_levels import load_df
+        _df = load_df(get_global_db(), code)
+    except Exception:
         return {"code": code, "name": name, "score": 0, "advice": "数据不足", "reasons": []}
+    if _df is None or len(_df) < 20:
+        return {"code": code, "name": name, "score": 0, "advice": "数据不足", "reasons": []}
+    klines = [
+        {"date": str(r['date'])[:10], "open": float(r['open']), "close": float(r['close']),
+         "high": float(r['high']), "low": float(r['low']), "volume": float(r['volume'])}
+        for _, r in _df.iterrows()
+    ]
     
     score = 50  # 基础分
     reasons = []
@@ -129,13 +105,13 @@ def analyze_stock(code, name):
     if rsi:
         if 30 < rsi < 70:
             score += 10
-            reasons.append(f"RSI适中({rsi:.0f})")
+            reasons.append(f"RSI {rsi:.0f}")
         elif rsi < 30:
             score += 15
-            reasons.append(f"RSI超卖({rsi:.0f})")
+            reasons.append(f"RSI超卖 {rsi:.0f}")
         elif rsi > 70:
             score -= 10
-            reasons.append(f"RSI超买({rsi:.0f})")
+            reasons.append(f"RSI超买 {rsi:.0f}")
     
     # 3. MACD分析
     dif, dea, macd = calculate_macd(klines)
@@ -213,25 +189,58 @@ def format_analysis_message(analyses):
     return "\n".join(lines)
 
 
-def generate_advice_for_hold(code, name):
+def generate_advice_for_hold(code, name, entry_date=None, entry_price=None):
     """对已推荐股票生成持仓操作建议：持有/减仓/卖出 + 止损/止盈价位
 
-    规则（结合 A 股主力特性）：
-      - 站上 MA5 → 持有；跌破 MA5（该强不强）→ 减仓；跌破 MA5/MA10 → 卖出
-      - 强者恒强豁免：强势创新高（站上MA5/MA10多头且逼近近20日高点）时，高位不构成减仓理由
-      - 高位偏离：高于月线(MA20)>10%、触及布林上轨、偏离5日线>10% → 兑现回调风险，提示减仓
-      - 放量滞涨：量能>5日均量1.5倍 但涨幅<2% → 出货信号
+    优先复用统一卖出路由 compute_sell_signal（与选股持有决策/排名卖点同一套规则）：
+    传入推荐日 entry_date（及推荐价 entry_price）后，若历史回扫触发卖出信号，
+    直接判定为「卖出」；否则再走本函数的技术强弱/高位偏离/放量滞涨判断。
     """
+    # ── 数据源：本地核心库K线（不再依赖外部行情接口）──
     try:
-        klines = get_stock_kline(code)
+        from utils.global_db import get_global_db
+        from utils.price_levels import load_df
+        _db = get_global_db()
+        _df = load_df(_db, code)
     except Exception:
         return None
-    if not klines or len(klines) < 25:
+    if _df is None or len(_df) < 25:
         return None
+    # 统一转成 klines(list of dict) 结构，兼容后续技术判断逻辑
+    klines = [
+        {"date": str(r['date'])[:10], "open": float(r['open']), "close": float(r['close']),
+         "high": float(r['high']), "low": float(r['low']), "volume": float(r['volume'])}
+        for _, r in _df.iterrows()
+    ]
 
     current = klines[-1]["close"]
     prev = klines[-2]["close"] if len(klines) >= 2 else current
     pct = (current - prev) / prev * 100 if prev else 0
+
+    # ── 优先复用统一卖出路由（避免与选股持有决策/排名卖点多套卖出逻辑不一致）──
+    if entry_date:
+        try:
+            from utils.sell_signal import compute_sell_signal
+            _px = entry_price
+            if not _px:
+                # 无推荐价时，从K线取推荐日收盘价作为命中价基准
+                _target = None
+                for _k in klines:
+                    if str(_k['date'])[:10] <= str(entry_date)[:10]:
+                        _target = _k['close']
+                _px = _target
+            if _px:
+                _sell = compute_sell_signal(_db, code, float(_px), str(entry_date)[:10])
+                if _sell and _sell.get('sell_status') == '卖出':
+                    _reason = _sell.get('sell_reason') or '触发卖出规则'
+                    _stop = _sell.get('sell_price')
+                    return {"code": code, "name": name, "current": round(current, 2),
+                            "pct": round(pct, 2), "level": "卖出",
+                            "signals": [f"触发卖出规则：{_reason}"],
+                            "stop": round(float(_stop), 2) if _stop else None,
+                            "target": None}
+        except Exception:
+            pass
 
     ma5 = calculate_ma(klines, 5)
     ma10 = calculate_ma(klines, 10)
@@ -261,24 +270,19 @@ def generate_advice_for_hold(code, name):
         if current < ma5 and current < ma10:
             level = "卖出"
             signals.append("跌破MA5/MA10")
-            stop = ma10
         elif current < ma5:
             level = "减仓"
             signals.append("跌破MA5(该强不强)")
-            stop = ma10 if ma10 else ma5
         else:
             level = "持有"
             signals.append("站上MA5")
-            stop = ma10 if ma10 else ma5
     elif ma5:
         if current < ma5:
             level = "减仓"
             signals.append("跌破MA5")
-            stop = ma5 * 0.97
         else:
             level = "持有"
             signals.append("站上MA5")
-            stop = ma5 * 0.97
 
     # 2) 高位偏离（月线 / 布林上轨 / 5日线）——强者恒强豁免
     dev5 = (current - ma5) / ma5 * 100 if ma5 else 0
@@ -295,8 +299,24 @@ def generate_advice_for_hold(code, name):
         if level == "持有":
             level = "减仓"
 
-    # 4) 止盈参考
-    target = round(high20 * 1.02, 2) if high20 > current else round(current * 1.10, 2)
+    # 4) 止损/止盈：用「趋势 + 多层支撑/压力位」量化（本地核心库），替代原简单 MA10 / high20*1.02
+    _rec = None
+    try:
+        from utils.price_levels import get_recommend
+        _rec = get_recommend(_db, code)
+    except Exception:
+        pass
+    if _rec:
+        stop = _rec['stop']
+        target = _rec['target']
+        # 卖出/减仓（转弱）时止损更贴近：用最近支撑下方 3%，与支撑位止损取更近者
+        if level in ("卖出", "减仓") and _rec['nearest_support']:
+            _tight = round(_rec['nearest_support'] * 0.97, 2)
+            stop = _tight if (stop is None or _tight < stop) else stop
+    else:
+        # 兜底：退化到原逻辑（数据不足时）
+        stop = ma10 if ma10 else (ma5 * 0.97 if ma5 else None)
+        target = round(high20 * 1.02, 2) if high20 > current else round(current * 1.10, 2)
 
     return {
         "code": code,

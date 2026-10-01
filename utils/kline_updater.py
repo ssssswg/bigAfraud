@@ -391,21 +391,26 @@ class KlineUpdater:
             logger.info(f"腾讯财经降级补充: {len(kline_data)}/{len(batch_codes)} 只有数据")
 
         if kline_data:
-            logger.debug(f"批量保存 {len(kline_data)} 只股票的K线数据...")
-            with self.db_manager.transaction():
-                for stock_code, df_kline in kline_data.items():
-                    if df_kline is not None and len(df_kline) > 0:
-                        try:
-                            batch_added, batch_updated = self._save_kline_records_batch(
-                                stock_code, df_kline, batch_size=100
-                            )
-                            added += batch_added
-                            updated += batch_updated
-                        except Exception as e:
-                            logger.error(f"保存 {stock_code} 数据失败: {str(e)}")
+            # 独占写窗口：本批保存期间独占，其他普通写错峰等待（避免抢写锁）
+            self.db_manager.begin_bulk_write()
+            try:
+                logger.debug(f"批量保存 {len(kline_data)} 只股票的K线数据...")
+                with self.db_manager.transaction():
+                    for stock_code, df_kline in kline_data.items():
+                        if df_kline is not None and len(df_kline) > 0:
+                            try:
+                                batch_added, batch_updated = self._save_kline_records_batch(
+                                    stock_code, df_kline, batch_size=100
+                                )
+                                added += batch_added
+                                updated += batch_updated
+                            except Exception as e:
+                                logger.error(f"保存 {stock_code} 数据失败: {str(e)}")
+                                failed += 1
+                        else:
                             failed += 1
-                    else:
-                        failed += 1
+            finally:
+                self.db_manager.end_bulk_write()
 
             final_missing = len([c for c in batch_codes if c not in kline_data])
             failed += final_missing
@@ -734,11 +739,15 @@ class KlineUpdater:
         """
         try:
             logger.info(f"【历史重建】{stock_code} 删除旧数据...")
-            conn = self.db_manager.connect()
-            cursor = conn.cursor()
-            cursor.execute("DELETE FROM stock_kline WHERE code = ?", (stock_code,))
-            conn.commit()
-            conn.close()
+            self.db_manager.begin_bulk_write()
+            try:
+                conn = self.db_manager.connect()
+                cursor = conn.cursor()
+                cursor.execute("DELETE FROM stock_kline WHERE code = ?", (stock_code,))
+                conn.commit()
+                conn.close()
+            finally:
+                self.db_manager.end_bulk_write()
             logger.info(f"【历史重建】{stock_code} 删除 {cursor.rowcount} 条旧数据")
 
             logger.info(f"【历史重建】{stock_code} 通过 TickFlow 重新获取 {years} 年历史数据...")

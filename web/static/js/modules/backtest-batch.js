@@ -476,7 +476,7 @@ class BacktestUIManager {
         <div style="display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 24px;">
           <div style="padding: 12px; border: 1px solid #e5e7eb; border-radius: 6px; background: #ffffff;">
             <div style="font-size: 12px; color: #6b7280; margin-bottom: 4px;">总收益率</div>
-            <div style="font-size: 24px; font-weight: bold; color: ${totalReturn >= 0 ? '#22c55e' : '#ef4444'};">
+            <div style="font-size: 24px; font-weight: bold; color: ${totalReturn >= 0 ? '#ef4444' : '#22c55e'};">
               ${totalReturn.toFixed(2)}%
             </div>
           </div>
@@ -539,7 +539,7 @@ class BacktestUIManager {
                     <td style="padding: 8px; font-size: 12px;">${(trade.buy_price || 0).toFixed(2)}</td>
                     <td style="padding: 8px; font-size: 12px;">${trade.sell_date || ''}</td>
                     <td style="padding: 8px; font-size: 12px;">${(trade.sell_price || 0).toFixed(2)}</td>
-                    <td style="padding: 8px; font-size: 12px; color: ${(trade.return_rate || 0) >= 0 ? '#22c55e' : '#ef4444'};">
+                    <td style="padding: 8px; font-size: 12px; color: ${(trade.return_rate || 0) >= 0 ? '#ef4444' : '#22c55e'};">
                       ${(trade.return_rate || 0).toFixed(2)}%
                     </td>
                   </tr>

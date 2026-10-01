@@ -40,9 +40,9 @@ export function switchPage(page) {
         'transactions': '交易历史',
         'strategies': '策略配置',
         'analysis': '个股图谱',
-        'stock-ranking': '选股排名',
-        'ranking-track': '排名跟踪',
+        'selection-track': '选股跟踪',
         'backtest-params': '回测配置',
+        'selection-config': '选股参数',
         'backtest-config': '策略回测',
         'backtest-results': '回测结果',
         'backtest-history': '回测历史',
@@ -64,9 +64,9 @@ export function switchPage(page) {
     
     // 加载页面数据
     if (page === 'dashboard') {
-        import('./stocks.js').then(module => module.loadStats());
+        import('./stocks.js?v=9').then(module => module.loadStats());
     } else if (page === 'stocks') {
-        import('./stocks.js').then(module => module.loadStocks());
+        import('./stocks.js?v=9').then(module => module.loadStocks());
     } else if (page === 'data-init') {
         // 初始化数据页面 - 重置表单
         console.log('调用 resetInitForm()');
@@ -75,7 +75,7 @@ export function switchPage(page) {
         // 数据更新页面 - 初始化
         initDataUpdatePage();
     } else if (page === 'history') {
-        import('./stocks.js').then(module => module.loadHistoryStrategyOptions());
+        import('./stocks.js?v=9').then(module => module.loadHistoryStrategyOptions());
         // 不再自动查询，等待用户点击查询按钮
         import('./history.js').then(module => module.showHistoryEmptyState('请点击"查询"按钮加载数据'));
     } else if (page === 'trading') {
@@ -92,33 +92,30 @@ export function switchPage(page) {
     } else if (page === 'analysis') {
         // 个股图谱页面 - 重置状态
         import('./analysis.js').then(module => module.resetScorePageState());
-    } else if (page === 'stock-ranking') {
-        // 选股排名页面 - 初始化
-        import('./ranking.js').then(module => module.initStockRankingPage());
-    } else if (page === 'ranking-track') {
-        // 排名跟踪页面 - 初始化
-        import('./ranking.js').then(module => module.initRankingTrackPage());
+    } else if (page === 'selection-track') {
+        // 选股跟踪页面 - 初始化（加载策略下拉 + 默认查询）
+        import('./ranking.js?v=12').then(module => module.initSelectionTrackPage());
     } else if (page === 'backtest-params') {
         // 回测参数配置页面 - 初始化
-        import('./backtest.js').then(module => module.initBacktestParamsPage());
+        import('./backtest.js?v=3').then(module => module.initBacktestParamsPage());
     } else if (page === 'backtest-config') {
         // 策略回测页面 - 初始化
-        import('./backtest.js').then(module => module.initBacktestConfigPage());
+        import('./backtest.js?v=3').then(module => module.initBacktestConfigPage());
     } else if (page === 'backtest-history') {
         // 回测历史页面 - 初始化
-        import('./backtest.js').then(module => module.initBacktestHistoryPage());
+        import('./backtest.js?v=3').then(module => module.initBacktestHistoryPage());
     } else if (page === 'khunter') {
         // 狩猎场页面 - 初始化
-        import('./khunter.js').then(module => module.initKHunterPage());
+        import('./khunter.js?v=3').then(module => module.initKHunterPage());
     } else if (page === 'khunter-track') {
         // 狩猎跟踪页面 - 初始化
-        import('./khunter.js').then(module => {
+        import('./khunter.js?v=3').then(module => {
             module.initKHunterTrackPage();
             module.setupKHunterTrackingEvents();
         });
     } else if (page === 'strategy-runner') {
         // 策略执行器页面 - 初始化
-        import('./strategy-runner.js').then(module => {
+        import('./strategy-runner.js?v=3').then(module => {
             module.default.initStrategyRunnerModule().catch(err => {
                 console.error('初始化策略执行器模块失败:', err);
             });

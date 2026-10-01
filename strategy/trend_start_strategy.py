@@ -63,29 +63,24 @@ class TrendStartStrategy(BaseStrategy):
         macd_slow = self.params['macd_slow']
         macd_signal = self.params['macd_signal']
         
-        ema_short = result['close'].ewm(span=macd_fast, adjust=False).mean()
-        ema_long = result['close'].ewm(span=macd_slow, adjust=False).mean()
-        macd_line = ema_short - ema_long
-        signal_line = macd_line.ewm(span=macd_signal, adjust=False).mean()
-        
-        result['dif'] = macd_line
-        result['dea'] = signal_line
-        result['macd_hist'] = macd_line - signal_line
-        
-        # 计算布林带指标
+        # 计算MACD指标（官方优先）
+        from utils import technical as _tech
+        _macd = _tech.MACD(result, macd_fast, macd_slow, macd_signal)
+        result['dif'] = _macd['macd']
+        result['dea'] = _macd['macd_signal']
+        result['macd_hist'] = _macd['macd'] - _macd['macd_signal']  # 原语义：DIF-DEA（1×）
+
+        # 计算布林带指标（官方优先）
         boll_period = self.params['boll_period']
         boll_multiplier = self.params['boll_multiplier']
-        
-        mid = result['close'].rolling(window=boll_period).mean()
-        std = result['close'].rolling(window=boll_period).std()
-        
-        result['boll_mid'] = mid
-        result['boll_upper'] = mid + boll_multiplier * std
-        result['boll_lower'] = mid - boll_multiplier * std
-        
+        _boll = _tech.Bollinger(result, boll_period, boll_multiplier)
+        result['boll_mid'] = _boll['bb_mid']
+        result['boll_upper'] = _boll['bb_upper']
+        result['boll_lower'] = _boll['bb_lower']
+
         # 计算5日均线和5日均量
         ma5_period = self.params['ma5_period']
-        result['ma5'] = result['close'].rolling(window=ma5_period).mean()
+        result['ma5'] = _tech.ma_norm(result, ma5_period)
         result['ma5_volume'] = result['volume'].rolling(window=ma5_period).mean()
         
         # 填充缺失值

@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 # 全局 DBManager 实例
 from utils.global_db import get_global_db
+from utils.sell_signal import compute_negative_signals
 global_db_manager = get_global_db()
 
 
@@ -103,7 +104,7 @@ def _load_veto_config() -> Tuple[bool, int, List[str]]:
         config_path = Path.cwd() / "config" / "strategy_weights.json"
     
     # 默认配置
-    default_enabled = True
+    default_enabled = False
     default_score = -100
     default_strategies = ["M头策略", "多死叉共振策略"]
     
@@ -287,6 +288,206 @@ class TechnicalScorer:
                 individual_strategies.append(strategy)
         return individual_strategies
 
+    def _score_by_indicators(self, close, ma5, ma10, ma20, ma60, dif, dea,
+                            k, d, j, rsi, vol_ratio, pct_chg,
+                            boll_up, boll_mid, boll_low):
+        """六维技术指标健康度评分（stk_factor_pro 字段，缺省回退自算），clip [-20, +30]
+
+        维度：①均线趋势(方向) ②MACD(动能) ③KDJ(超买超卖钝化) ④RSI(健康度)
+              ⑤BOLL(位置：温和突破/严重超买/破位) ⑥量能(验证真假)
+        """
+        def _f(v):
+            try:
+                return float(v)
+            except Exception:
+                return None
+        close = _f(close); ma5 = _f(ma5); ma10 = _f(ma10); ma20 = _f(ma20); ma60 = _f(ma60)
+        dif = _f(dif); dea = _f(dea)
+        k = _f(k); d = _f(d); j = _f(j)
+        rsi = _f(rsi); vr = _f(vol_ratio); pc = _f(pct_chg)
+        bu = _f(boll_up); bm = _f(boll_mid); bl = _f(boll_low)
+
+        score = 0.0
+        sig = []
+        # ① 均线趋势（定方向，权重最高）
+        if close and ma5 and ma10 and ma20:
+            if ma5 > ma10 > ma20:
+                score += 8; sig.append('均线多头排列')
+            elif ma5 < ma10 < ma20:
+                score -= 6; sig.append('均线空头排列')
+        if close and ma20 is not None:
+            if close > ma20:
+                score += 5; sig.append('站上MA20')
+            else:
+                score -= 8; sig.append('跌破MA20')
+        if close and ma60 is not None:
+            if close > ma60:
+                score += 3; sig.append('站上MA60')
+            else:
+                score -= 4; sig.append('跌破MA60')
+        # ② MACD（动能）
+        if dif is not None and dea is not None:
+            if dif > dea:
+                if dif > 0:
+                    score += 6; sig.append('MACD多头')
+                else:
+                    score += 2; sig.append('MACD水下金叉')
+            else:
+                if dea > 0:
+                    score -= 6; sig.append('MACD高位死叉')
+                else:
+                    score -= 4; sig.append('MACD空头')
+        # ③ KDJ（超买超卖钝化）
+        if k is not None and d is not None:
+            if k > d:
+                if d < 20:
+                    score += 6; sig.append('KDJ低位金叉')
+                elif d < 80:
+                    score += 4; sig.append('KDJ金叉')
+            else:
+                if d > 80:
+                    score -= 6; sig.append('KDJ高位死叉')
+                else:
+                    score -= 3; sig.append('KDJ死叉')
+            if j is not None:
+                if k > 80 and j > 100:
+                    score -= 4; sig.append('KDJ超买钝化')
+                elif k < 20 and j < 0:
+                    score += 3; sig.append('KDJ超卖')
+        # ④ RSI（健康度）
+        if rsi is not None:
+            if 45 <= rsi <= 70:
+                score += 5; sig.append('RSI适中')
+            elif 70 < rsi <= 80:
+                score += 1
+            elif rsi > 80:
+                score -= 6; sig.append('RSI超买')
+            elif 25 <= rsi < 45:
+                pass
+            else:
+                score += 3; sig.append('RSI超卖')
+        # ⑤ BOLL（位置）
+        if close and bu is not None:
+            if close > bu * 1.03:
+                score -= 6; sig.append('突破布林上轨超3%')
+            elif close > bu:
+                score += 3; sig.append('突破布林上轨(强势)')
+            elif bm is not None and close > bm:
+                score += 2
+            elif bl is not None and close < bl:
+                score -= 4; sig.append('跌破布林下轨')
+        # ⑥ 量能（验证真假）
+        if vr is not None:
+            if vr > 3 and pc is not None and pc < 0:
+                score -= 5; sig.append('天量下跌')
+            elif vr > 3 and pc is not None and pc > 0:
+                score += 2; sig.append('放量突破')
+            elif 1.0 <= vr <= 2.5 and pc is not None and pc > 0:
+                score += 3; sig.append('温和放量')
+            elif vr < 0.8 and pc is not None and pc > 0:
+                score -= 2; sig.append('缩量上涨(动能不足)')
+        return max(-20.0, min(30.0, score)), sig
+
+    def _factor_health_score(self, stock_code: str, date_str: str):
+        """技术指标健康度评分，供技术面评分复用。
+
+        数据源优先 stk_factor_pro（Tushare 专业技术面因子 doc 328：MA/MACD/KDJ/RSI/BOLL/量比/涨跌幅），
+        字段缺失时回退到 stock_kline 自算（同 distribution 策略）。
+        返回 (健康度分, 信号列表)；取不到数据返回 (0, [])。
+        """
+        d = date_str.replace('-', '')
+        # ---- 优先 stk_factor_pro 现成技术指标 ----
+        try:
+            from utils import factor_fetcher
+            pro = factor_fetcher.get_pro()
+            if pro is not None:
+                from datetime import datetime, timedelta
+                ts = factor_fetcher.to_ts_code(stock_code)
+                end_dt = datetime.strptime(d, '%Y%m%d')
+                start = (end_dt - timedelta(days=90)).strftime('%Y%m%d')
+                df = factor_fetcher.get_factor_history(pro, ts, start, d)
+                row = factor_fetcher._last_factor(df, d)
+                if row and row.get('close') is not None and row.get('macd_dif_bfq') is not None and row.get('boll_upper_bfq') is not None:
+                    # 官方 kdj_bfq 即 KDJ 的 J 值
+                    _j_ = row.get('kdj_bfq')
+                    return self._score_by_indicators(
+                        row.get('close'), row.get('ma_bfq_5'), row.get('ma_bfq_10'),
+                        row.get('ma_bfq_20'), row.get('ma_bfq_60'),
+                        row.get('macd_dif_bfq'), row.get('macd_dea_bfq'),
+                        row.get('kdj_k_bfq'), row.get('kdj_d_bfq'), _j_,
+                        row.get('rsi_bfq_12'), row.get('volume_ratio'), row.get('pct_chg'),
+                        row.get('boll_upper_bfq'), row.get('boll_mid_bfq'), row.get('boll_lower_bfq'))
+        except Exception as e:
+            logger.debug(f"stk_factor_pro 因子获取失败 {stock_code}: {e}")
+        # ---- 回退：stock_kline 自算 ----
+        try:
+            import pandas as pd
+            from datetime import datetime
+            rows = self.db.query(
+                "SELECT date, open, high, low, close, volume FROM stock_kline "
+                "WHERE code = ? ORDER BY date DESC LIMIT 200", (stock_code,))
+            if not rows:
+                return 0.0, []
+            def _pd(t):
+                t = str(t)
+                try:
+                    return datetime.strptime(t[:10], '%Y-%m-%d') if '-' in t else datetime.strptime(t[:8], '%Y%m%d')
+                except Exception:
+                    return None
+            out = []
+            for r in rows:
+                dt = _pd(r.get('date'))
+                if dt is None:
+                    continue
+                out.append((dt, r))
+            out.sort(key=lambda x: x[0])
+            target = datetime.strptime(d, '%Y%m%d')
+            out = [x for x in out if x[0] <= target]
+            if not out:
+                return 0.0, []
+            out = out[-120:]
+            df = pd.DataFrame([r for _, r in out],
+                              columns=['date', 'open', 'high', 'low', 'close', 'volume'])
+            cl = df['close'].astype(float)
+            high = df['high'].astype(float)
+            low = df['low'].astype(float)
+            vol = df['volume'].astype(float)
+            if len(cl) < 20:
+                return 0.0, []
+            close = float(cl.iloc[-1])
+            ma5 = float(cl.rolling(5).mean().iloc[-1])
+            ma10 = float(cl.rolling(10).mean().iloc[-1])
+            ma20 = float(cl.rolling(20).mean().iloc[-1])
+            ma60 = float(cl.rolling(60).mean().iloc[-1]) if len(cl) >= 60 else None
+            ema12 = cl.ewm(span=12, adjust=False).mean()
+            ema26 = cl.ewm(span=26, adjust=False).mean()
+            dif = float((ema12 - ema26).iloc[-1])
+            dea = float((ema12 - ema26).ewm(span=9, adjust=False).mean().iloc[-1])
+            delta = cl.diff()
+            up = delta.clip(lower=0)
+            down = (-delta.clip(upper=0))
+            rs = up.rolling(14).mean() / (down.rolling(14).mean() + 1e-9)
+            rsi = float((100 - 100 / (1 + rs)).iloc[-1])
+            llv = low.rolling(9).min()
+            hhv = high.rolling(9).max()
+            rsv = (cl - llv) / (hhv - llv + 1e-9) * 100
+            k_ = rsv.ewm(com=2, adjust=False).mean()
+            d_ = k_.ewm(com=2, adjust=False).mean()
+            k = float(k_.iloc[-1]); dd = float(d_.iloc[-1]); j = float(3 * k - 2 * dd)
+            mid = cl.rolling(20).mean()
+            std = cl.rolling(20).std()
+            boll_up = float((mid + 2 * std).iloc[-1])
+            boll_mid = float(mid.iloc[-1])
+            boll_lo = float((mid - 2 * std).iloc[-1])
+            vol_ratio = float(vol.iloc[-1] / (vol.rolling(5).mean().iloc[-1] + 1e-9))
+            pct_chg = float(cl.pct_change().iloc[-1] * 100) if len(cl) > 1 else 0.0
+            return self._score_by_indicators(
+                close, ma5, ma10, ma20, ma60, dif, dea, k, dd, j, rsi,
+                vol_ratio, pct_chg, boll_up, boll_mid, boll_lo)
+        except Exception as e:
+            logger.debug(f"K线自算技术指标失败 {stock_code}: {e}")
+            return 0.0, []
+
     def calculate_score(
         self, stock_code: str, score_date: str, hit_strategies: List[str] = None
     ) -> Tuple[float, TechnicalDetail]:
@@ -310,7 +511,16 @@ class TechnicalScorer:
 
         # 统一日期格式
         formatted_date = self._format_date(score_date)
-        
+
+        # 计算技术面负面指标（破位/离5日线10%/超布林上轨10%/放量滞涨/放量大跌），用于评分扣分
+        try:
+            _neg = compute_negative_signals(self.db, stock_code, formatted_date)
+            _neg_score = _neg.get('score', 0)
+            detail.negative_signals = _neg.get('list', [])
+        except Exception:
+            _neg_score = 0
+            detail.negative_signals = []
+
         # 如果没有传入策略列表，从数据库查询
         if hit_strategies is None:
             hit_strategies = self._query_hit_strategies(stock_code, formatted_date)
@@ -358,15 +568,27 @@ class TechnicalScorer:
             detail.veto = veto
             detail.veto_reason = veto_reason
             
+            total_score += _neg_score
+            # stk_factor_pro 技术因子健康度（MACD/KDJ/RSI/BOLL/均线）并入技术面评分
+            _fac, _fac_sig = self._factor_health_score(stock_code, formatted_date)
+            total_score += _fac
+            detail.factor_score = _fac
+            detail.factor_signals = _fac_sig
             logger.info(
                 f"股票 {stock_code} 从stock_selection_record表计算技术面得分: {total_score}, "
-                f"策略数: {len(strategy_list)}, 否决: {veto}"
+                f"策略数: {len(strategy_list)}, 否决: {veto}, 负面指标: {detail.negative_signals}"
             )
             return total_score, detail
         else:
-            # 没有策略命中记录，返回0分
-            logger.warning(f"股票 {stock_code} 在 {formatted_date} 没有命中任何策略")
-            return 0.0, detail
+            # 未命中策略：仍给技术指标健康度基础分（stk_factor_pro / K线自算），
+            # 避免"没有命中策略就一律 0 分"导致技术面失真
+            _fac, _fac_sig = self._factor_health_score(stock_code, formatted_date)
+            detail.factor_score = _fac
+            detail.factor_signals = _fac_sig
+            logger.info(
+                f"股票 {stock_code} 在 {formatted_date} 未命中策略，技术面=基础指标分 {_fac} 信号={_fac_sig}"
+            )
+            return _fac, detail
 
         # 下面的代码暂时保留，但不会被执行（作为备用逻辑）
         # 从stock_score_detail表查询技术面评分数据

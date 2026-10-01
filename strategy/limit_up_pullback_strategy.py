@@ -114,10 +114,11 @@ class LimitUpPullbackStrategy(BaseStrategy):
         result['is_limit_up'] = result['pct_change'] >= self.params['limit_up_threshold']
         result = result.drop('pct_change', axis=1)
 
-        # 1. 计算均线（直接在正序数据上计算，避免反转）
-        result['ma5'] = result['close'].rolling(window=5, min_periods=1).mean()
-        result['ma10'] = result['close'].rolling(window=10, min_periods=1).mean()
-        result['ma20'] = result['close'].rolling(window=20, min_periods=1).mean()
+        # 1. 计算均线（官方优先，顺序无关）
+        from utils import technical as _tech
+        result['ma5'] = _tech.ma_norm(result, 5)
+        result['ma10'] = _tech.ma_norm(result, 10)
+        result['ma20'] = _tech.ma_norm(result, 20)
 
         # 2. 计算成交量均线
         result['volume_ma5'] = result['volume'].rolling(window=5, min_periods=1).mean()

@@ -21,6 +21,23 @@ from utils.global_db import get_global_db
 logger = logging.getLogger(__name__)
 
 
+
+def strategy_filter_candidates(name: str) -> list:
+    """
+    策略名归一化为多个候选匹配词，用于选股记录按策略名筛选。
+    兼容策略 name 与表中存储名的差异（如 '2560战法选股策略' vs 表中 '2560战法'）。
+    """
+    cands = [name]
+    if not name:
+        return cands
+    for suf in ('选股策略', '策略', '选股'):
+        if name.endswith(suf):
+            c = name[:-len(suf)]
+            if c and c not in cands:
+                cands.append(c)
+    return cands
+
+
 class SelectionRecordManager:
     """
     选股记录管理器
@@ -75,6 +92,10 @@ class SelectionRecordManager:
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             is_active INTEGER NOT NULL DEFAULT 1,
             strategy_count INTEGER NOT NULL DEFAULT 1,
+            sell_status VARCHAR(20),
+            sell_price DECIMAL(10,2),
+            sell_reason TEXT,
+            sell_yield DECIMAL(10,2),
             UNIQUE(stock_code, selection_date)
         )
         """
@@ -100,6 +121,18 @@ class SelectionRecordManager:
             if 'strategy_count' not in columns:
                 self.db_manager.execute_with_retry("ALTER TABLE stock_selection_record ADD COLUMN strategy_count INTEGER DEFAULT 1")
                 logger.info("数据库迁移：添加strategy_count字段")
+            if 'sell_status' not in columns:
+                self.db_manager.execute_with_retry("ALTER TABLE stock_selection_record ADD COLUMN sell_status VARCHAR(20)")
+                logger.info("数据库迁移：添加sell_status字段")
+            if 'sell_price' not in columns:
+                self.db_manager.execute_with_retry("ALTER TABLE stock_selection_record ADD COLUMN sell_price DECIMAL(10,2)")
+                logger.info("数据库迁移：添加sell_price字段")
+            if 'sell_reason' not in columns:
+                self.db_manager.execute_with_retry("ALTER TABLE stock_selection_record ADD COLUMN sell_reason TEXT")
+                logger.info("数据库迁移：添加sell_reason字段")
+            if 'sell_yield' not in columns:
+                self.db_manager.execute_with_retry("ALTER TABLE stock_selection_record ADD COLUMN sell_yield DECIMAL(10,2)")
+                logger.info("数据库迁移：添加sell_yield字段")
         except Exception as e:
             logger.warning(f"数据库迁移失败: {str(e)}")
         
@@ -212,6 +245,7 @@ class SelectionRecordManager:
                             'stock_name': signal.get('name', '未知'),
                             'strategy_name': strategy_name,
                             'industry': industry,
+                            'sector': self._get_stock_sector(stock_code),
                             'selection_price': selection_price,
                             'key_dates': key_dates,
                             'strategy_count': strategy_count
@@ -225,11 +259,19 @@ class SelectionRecordManager:
                 logger.warning(f"选股日期 {selection_date} 无有效信号，跳过保存")
                 return {'success': True, 'saved': 0, 'skipped': 0, 'updated': 0, 'error': 0}
 
-            # 保存前先删除该选股日期当天的旧记录，避免同一天多次选股后数据累积
+            # 保存前先删除该选股日期当天的旧记录（选股记录 + 评分），全面覆盖当天所有数据，
+            # 避免同一天多次选股后数据累积 / 旧评分残留
             try:
                 delete_sql = "DELETE FROM stock_selection_record WHERE selection_date = ? AND is_active = 1"
                 self.db_manager.execute_with_retry(delete_sql, (selection_date,))
-                logger.info(f"已清理选股日期 {selection_date} 的旧记录，本次整批保存最新选股结果")
+                _sdate = str(selection_date)
+                for _t, _c in (('stock_score_detail', 'score_date'), ('stock_score', 'score_date')):
+                    try:
+                        self.db_manager.execute_with_retry(
+                            f"DELETE FROM {_t} WHERE {_c} = ?", (_sdate,))
+                    except Exception as _e:
+                        logger.warning(f"清理 {_t} 日期 {_sdate} 数据失败: {_e}")
+                logger.info(f"已全面清理选股日期 {selection_date} 的旧数据（选股记录+评分），本次整批保存最新结果")
             except Exception as e:
                 logger.warning(f"清理选股日期 {selection_date} 的旧记录失败: {str(e)}")
 
@@ -260,8 +302,8 @@ class SelectionRecordManager:
                     else:
                         # 新股票，直接保存
                         self._insert_record(strategy_name, stock_code, stock_name,
-                                          industry, selection_date, selection_time,
-                                          selection_price, key_dates, stock_info.get('strategy_count', 1))
+                                          industry, stock_info.get('sector', ''), selection_date, selection_time,
+                                          selection_price, key_dates, stock_info.get('strategy_count', 1), 0)
                         stats['saved'] += 1
                 except Exception as e:
                     logger.error(f"保存股票 {stock_info.get('stock_code')} 失败: {str(e)}")
@@ -274,6 +316,12 @@ class SelectionRecordManager:
             if stats['saved'] > 0 or stats['updated'] > 0:
                 conn = self.db_manager.connect()
                 conn.commit()
+            
+            # 补充技术面评分 + 按累计收益率排名
+            try:
+                self._finalize_scores_and_rank(selection_date)
+            except Exception as e:
+                logger.warning(f"补充评分/排名失败: {str(e)}")
             
             return {
                 'success': True,
@@ -291,8 +339,9 @@ class SelectionRecordManager:
             }
     
     def _insert_record(self, strategy_name: str, stock_code: str, stock_name: str,
-                      industry: str, selection_date, selection_time: datetime,
-                      selection_price: float, key_dates: str = None, strategy_count: int = 1):
+                      industry: str, sector: str, selection_date, selection_time: datetime,
+                      selection_price: float, key_dates: str = None, strategy_count: int = 1,
+                      score: float = None):
         """
         插入选股记录
         
@@ -301,27 +350,84 @@ class SelectionRecordManager:
             stock_code: 股票代码
             stock_name: 股票名称
             industry: 行业
+            sector: 板块
             selection_date: 选入日期
             selection_time: 选入时间
             selection_price: 选入价格
             key_dates: 关键日期信息（JSON字符串）
             strategy_count: 命中策略个数
+            score: 技术面评分
         """
         insert_sql = """
         INSERT INTO stock_selection_record 
-        (strategy_name, stock_code, stock_name, industry, 
-         selection_date, selection_time, selection_price, key_dates, created_at, updated_at, is_active, strategy_count)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
+        (strategy_name, stock_code, stock_name, industry, sector, 
+         selection_date, selection_time, selection_price, key_dates, score, created_at, updated_at, is_active, strategy_count)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)
         """
         
         now = datetime.now()
         self.db_manager.execute_with_retry(insert_sql, (
-            strategy_name, stock_code, stock_name, industry,
-            selection_date, selection_time, selection_price, key_dates, now, now, strategy_count
+            strategy_name, stock_code, stock_name, industry, sector,
+            selection_date, selection_time, selection_price, key_dates, score, now, now, strategy_count
         ))
         
         # 不需要再调用 _update_strategy_count，因为我们已经知道策略数量
     
+    def _finalize_scores_and_rank(self, selection_date):
+        """
+        保存选股记录后调用：
+          1. 为每只股票计算技术面评分（本地，快）写入 score
+          2. 按选入后累计收益率（最新收盘 vs 选入价）降序写入 rank_position
+        """
+        try:
+            from trading.technical_scorer import TechnicalScorer
+            date_str = str(selection_date) if not isinstance(selection_date, str) else selection_date
+            cur = self.db_manager.execute_with_retry(
+                "SELECT stock_code, selection_price FROM stock_selection_record "
+                "WHERE selection_date=? AND is_active=1", (date_str,))
+            rows = cur.fetchall() if cur else []
+            if not rows:
+                logger.info(f"选股日 {date_str} 无记录，跳过评分/排名")
+                return
+            scorer = TechnicalScorer(self.db_manager)
+            items = []
+            for code, price in rows:
+                score = 0.0
+                try:
+                    score, _ = scorer.calculate_score(code, date_str)
+                except Exception as e:
+                    logger.warning(f"技术面评分失败 {code}: {e}")
+                latest_close = None
+                try:
+                    c = self.db_manager.execute_with_retry(
+                        "SELECT close FROM stock_kline WHERE code=? ORDER BY date DESC LIMIT 1", (code,))
+                    r = c.fetchone()
+                    latest_close = r[0] if r else None
+                except Exception:
+                    latest_close = None
+                try:
+                    price = float(price) if price else 0.0
+                except Exception:
+                    price = 0.0
+                cum = ((float(latest_close) - price) / price * 100) if (latest_close and price) else 0.0
+                items.append({'code': code, 'score': score, 'cum': cum})
+            # 写入技术面评分
+            for it in items:
+                self.db_manager.execute_with_retry(
+                    "UPDATE stock_selection_record SET score=? "
+                    "WHERE stock_code=? AND selection_date=? AND is_active=1",
+                    (round(float(it['score']), 2), it['code'], date_str))
+            # 按累计收益率降序排名
+            ranked = sorted(items, key=lambda x: x['cum'], reverse=True)
+            for idx, it in enumerate(ranked, 1):
+                self.db_manager.execute_with_retry(
+                    "UPDATE stock_selection_record SET rank_position=? "
+                    "WHERE stock_code=? AND selection_date=? AND is_active=1",
+                    (idx, it['code'], date_str))
+            logger.info(f"选股日 {date_str} 补充技术面评分+按累计收益率排名完成，共 {len(items)} 只")
+        except Exception as e:
+            logger.warning(f"补充评分/排名失败: {str(e)}")
+
     def _update_strategy_count(self, stock_code: str, selection_date):
         """
         更新股票的策略计数
@@ -445,106 +551,60 @@ class SelectionRecordManager:
     def _get_stock_sector(self, stock_code: str) -> str:
         """
         获取股票板块信息
-        从stock_score_detail表获取最优板块（得分最高的板块）
-        
+        优先从 stock_score_detail 取最优板块，其次 stock_sector_mapping/stock_sector，最后回退 stock_basic 行业
+
         参数：
             stock_code: 股票代码
-        
+
         返回：
             板块名称，如果获取失败返回空字符串
         """
         try:
-            # 从stock_score_detail表获取最新的板块详情
-            sector_details = None
-            def callback(row):
-                nonlocal sector_details
-                if row and row[0]:
-                    sector_details = row[0]
-            
-            self.db_manager.execute_with_retry("""
-                SELECT sector_details 
-                FROM stock_score_detail 
-                WHERE stock_code = ? 
-                ORDER BY score_date DESC 
-                LIMIT 1
-            """, (stock_code,), callback=callback)
-            
-            if sector_details:
+            # 1) 从 stock_score_detail 获取最新的板块详情
+            cur = self.db_manager.execute_with_retry(
+                "SELECT sector_details FROM stock_score_detail "
+                "WHERE stock_code = ? ORDER BY score_date DESC LIMIT 1", (stock_code,))
+            row = cur.fetchone() if cur else None
+            if row and row[0]:
                 try:
-                    # 解析JSON格式的板块详情
-                    sector_data = json.loads(sector_details)
-                    
-                    # 直接从sector_details中获取板块名称
-                    # 因为SectorDetail.to_dict()返回的是单个板块信息
+                    sector_data = json.loads(row[0])
                     if 'sector_name' in sector_data and sector_data['sector_name']:
                         return sector_data['sector_name']
-                    # 兼容旧格式：如果有sectors列表，按得分排序取最高
                     elif 'sectors' in sector_data and isinstance(sector_data['sectors'], list):
-                        # 按得分降序排序
-                        sorted_sectors = sorted(sector_data['sectors'], 
-                                              key=lambda x: x.get('score', 0), 
-                                              reverse=True)
-                        
-                        # 返回得分最高的板块名称
-                        if sorted_sectors:
-                            best_sector = sorted_sectors[0]
-                            if 'name' in best_sector:
-                                return best_sector['name']
+                        best = sorted(sector_data['sectors'],
+                                      key=lambda x: x.get('score', 0), reverse=True)
+                        if best and best[0].get('name'):
+                            return best[0]['name']
                 except Exception as e:
                     logger.debug(f"解析板块详情失败: {str(e)}")
-            
-            # 如果没有评分数据，尝试从stock_sector_mapping表获取最新的板块信息
+            # 2) stock_sector_mapping -> stock_sector
             try:
-                # 先获取最新的板块代码
-                sector_code = None
-                def sector_code_callback(row):
-                    nonlocal sector_code
-                    if row and row[0]:
-                        sector_code = row[0]
-                
-                self.db_manager.execute_with_retry("""
-                    SELECT sector_code 
-                    FROM stock_sector_mapping 
-                    WHERE stock_code = ? 
-                    ORDER BY mapping_date DESC 
-                    LIMIT 1
-                """, (stock_code,), callback=sector_code_callback)
-                
-                if sector_code:
-                    # 再从stock_sector表获取板块名称
-                    sector_name = None
-                    def sector_name_callback(row):
-                        nonlocal sector_name
-                        if row and row[0]:
-                            sector_name = row[0]
-                    
-                    self.db_manager.execute_with_retry("SELECT sector_name FROM stock_sector WHERE sector_code = ?", 
-                                                     (sector_code,), callback=sector_name_callback)
-                    if sector_name:
-                        return sector_name
+                cur = self.db_manager.execute_with_retry(
+                    "SELECT sector_code FROM stock_sector_mapping "
+                    "WHERE stock_code = ? ORDER BY mapping_date DESC LIMIT 1", (stock_code,))
+                row = cur.fetchone() if cur else None
+                if row and row[0]:
+                    cur2 = self.db_manager.execute_with_retry(
+                        "SELECT sector_name FROM stock_sector WHERE sector_code = ?", (row[0],))
+                    r2 = cur2.fetchone() if cur2 else None
+                    if r2 and r2[0]:
+                        return r2[0]
             except Exception as e:
-                logger.debug(f"从stock_sector_mapping表获取板块信息失败: {str(e)}")
-            
-            # 如果没有板块映射，尝试从stock_basic表获取行业信息作为板块（因为stock_basic表没有sector字段）
+                logger.debug(f"从stock_sector_mapping获取板块失败: {str(e)}")
+            # 3) 回退 stock_basic 行业
             try:
-                industry = None
-                def industry_callback(row):
-                    nonlocal industry
-                    if row and row[0]:
-                        industry = row[0]
-                
-                self.db_manager.execute_with_retry("SELECT industry FROM stock_basic WHERE code = ?", 
-                                                 (stock_code,), callback=industry_callback)
-                if industry:
-                    return industry
+                cur = self.db_manager.execute_with_retry(
+                    "SELECT industry FROM stock_basic WHERE code = ?", (stock_code,))
+                row = cur.fetchone() if cur else None
+                if row and row[0]:
+                    return row[0]
             except Exception as e:
-                logger.debug(f"从stock_basic表获取行业信息失败: {str(e)}")
-            
+                logger.debug(f"从stock_basic获取行业失败: {str(e)}")
             return ''
         except Exception as e:
             logger.warning(f"获取股票 {stock_code} 板块信息失败: {str(e)}")
             return ''
-    
+
     def get_selection_history(self, filters: Optional[Dict] = None, 
                              page: int = 1, limit: int = 20) -> Dict:
         """
@@ -649,21 +709,16 @@ class SelectionRecordManager:
                     
                     # 如果有策略名称筛选，检查是否包含该策略
                     if strategy_name_filter:
-                        # 检查是否有策略名称包含筛选条件（兼容有无"策略"二字的情况）
-                        filter_text = strategy_name_filter
-                        # 移除"策略"二字进行比较
-                        filter_text_no_strategy = filter_text.replace('策略', '')
-                        
+                        # 策略名归一化匹配（兼容 name 与表存储名的差异）
+                        cands = strategy_filter_candidates(strategy_name_filter)
                         matched = False
                         for strategy in strategies:
-                            # 检查原始策略名称是否包含筛选条件
-                            if filter_text in strategy:
-                                matched = True
-                                break
-                            # 检查移除"策略"二字后的策略名称是否包含筛选条件
-                            strategy_no_strategy = strategy.replace('策略', '')
-                            if filter_text_no_strategy in strategy_no_strategy:
-                                matched = True
+                            strat_ns = strategy.replace('策略', '')
+                            for cand in cands:
+                                if cand in strategy or cand.replace('策略', '') in strat_ns:
+                                    matched = True
+                                    break
+                            if matched:
                                 break
                         
                         if not matched:

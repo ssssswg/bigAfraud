@@ -165,8 +165,10 @@ class BaseStrategy(ABC):
         elif not self.quick_filter(df):
             return []
 
+        from utils import technical as _tech
         try:
-            df = self.calculate_indicators(df)
+            with _tech.official_factor_scope(stock_code, df):
+                df = self.calculate_indicators(df)
         except Exception:
             return []
 

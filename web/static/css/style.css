@@ -773,6 +773,35 @@ body {
     border: 1px solid #e5e7eb;
 }
 
+/* 每日涨跌幅列表（K线弹窗右侧，可滚动） */
+.stock-change-list {
+    width: 250px;
+    height: 500px;
+    overflow-y: auto;
+    border: 1px solid #e5e7eb;
+    border-radius: 8px;
+    background: #fff;
+    flex-shrink: 0;
+}
+.scl-title {
+    padding: 10px 12px;
+    font-weight: 700;
+    font-size: 13px;
+    color: #1f2937;
+    border-bottom: 1px solid #e5e7eb;
+}
+.scl-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.scl-table th {
+    padding: 6px 10px;
+    color: #666;
+    font-weight: 600;
+    text-align: right;
+    background: #f9fafb;
+    border-bottom: 1px solid #e5e7eb;
+}
+.scl-table th:first-child, .scl-table td:first-child { text-align: left; }
+.scl-table td { padding: 6px 10px; border-bottom: 1px solid #f3f4f6; }
+
 /* 响应式 */
 @media (max-width: 768px) {
     .sidebar {

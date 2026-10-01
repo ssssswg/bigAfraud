@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>缅A每日推送</title>
     <link rel="icon" type="image/svg+xml" href="/static/images/favicon.svg">
-    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="stylesheet" href="/static/css/style.css?v=1">
     <link rel="stylesheet" href="/static/css/khunter.css">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
@@ -269,11 +269,8 @@
                 <li class="nav-item" data-page="analysis">
                     <span class="icon">📈</span> 个股图谱
                 </li>
-                <li class="nav-item" data-page="stock-ranking">
-                    <span class="icon">🏆</span> 选股排名
-                </li>
-                <li class="nav-item" data-page="ranking-track">
-                    <span class="icon">📉</span> 排名跟踪
+                <li class="nav-item" data-page="selection-track">
+                    <span class="icon">🏆</span> 选股跟踪
                 </li>
                 
                 <!-- 回测管理 -->
@@ -303,6 +300,9 @@
                 </li>
                 <li class="nav-item" data-page="backtest-params">
                     <span class="icon">🔧</span> 回测配置
+                </li>
+                <li class="nav-item" data-page="selection-config">
+                    <span class="icon">🎯</span> 选股参数
                 </li>
             </ul>
 
@@ -455,6 +455,7 @@
                                     <tr><td colspan="7" class="loading">加载中...</td></tr>
                                 </tbody>
                             </table>
+                            <div id="stocks-pagination" style="display:none; margin-top:15px; text-align:center; align-items:center; justify-content:center; gap:8px; flex-wrap:wrap;"></div>
                         </div>
                     </div>
                 </div>
@@ -726,18 +727,18 @@
                         <div class="filter-section" style="background: #f9fafb; padding: 15px; border-radius: 6px; margin-bottom: 15px;">
                             <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 10px;">
                                 <div>
+                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">开始日期</label>
+                                    <input type="date" id="history-start-date" style="width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; background-color: white;">
+                                </div>
+                                <div>
+                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">结束日期</label>
+                                    <input type="date" id="history-end-date" style="width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; background-color: white;">
+                                </div>
+                                <div>
                                     <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">选股方案</label>
                                     <select id="history-strategy-filter" style="width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px; background-color: white;">
                                         <option value="">全部策略</option>
                                     </select>
-                                </div>
-                                <div>
-                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">开始日期</label>
-                                    <input type="date" id="history-start-date" style="width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;">
-                                </div>
-                                <div>
-                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">结束日期</label>
-                                    <input type="date" id="history-end-date" style="width: 100%; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;">
                                 </div>
                             </div>
                             <div style="display: flex; gap: 10px;">
@@ -754,15 +755,14 @@
                         <!-- 表格 -->
                         <div class="table-container">
                             <table class="data-table" id="history-table" style="display: none;">
-                                <thead>
+                                <thead id="history-thead">
                                     <tr>
-                                        <th>选股方案</th>
-                                        <th>股票代码</th>
+                                        <th>选股日期</th>
                                         <th>股票名称</th>
-                                        <th>选入日期</th>
-                                        <th>选入价格</th>
-                                        <th>当前价格</th>
-                                        <th>最高/最低</th>
+                                        <th>命中的策略</th>
+                                        <th>选入价</th>
+                                        <th>评分</th>
+                                        <th>命中策略数</th>
                                     </tr>
                                 </thead>
                                 <tbody id="history-tbody">
@@ -777,23 +777,8 @@
                         <div id="history-pagination" style="display: none; text-align: center; margin-top: 15px; font-size: 12px;">
                         </div>
 
-                        <!-- 连续选股统计 -->
-                        <div style="margin-top: 24px; background: #f9fafb; padding: 15px; border-radius: 6px; border: 1px solid #e5e7eb;">
-                            <div style="font-size: 15px; font-weight: 600; color: #374151; margin-bottom: 12px;">📊 连续选股统计（最近 N 天选股差异）</div>
-                            <div style="display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; margin-bottom: 15px;">
-                                <div>
-                                    <label style="font-size: 12px; font-weight: 600; color: #374151; display: block; margin-bottom: 5px;">统计天数</label>
-                                    <input type="number" id="continuity-days" value="5" min="2" max="30" style="width: 100px; padding: 6px; border: 1px solid #d1d5db; border-radius: 4px; font-size: 12px;">
-                                </div>
-                                <button class="btn btn-primary" onclick="loadSelectionContinuity()" style="padding: 6px 12px; font-size: 12px;">🔍 统计连续选股</button>
-                            </div>
-                            <div id="continuity-result">
-                                <p style="color: #6b7280; font-size: 12px;">点击"统计连续选股"查看最近几天的选股连续性与每日差异</p>
-                            </div>
-                        </div>
-                    </div>
+                                            </div>
                 </div>
-
 
 
                 <!-- 策略配置页 -->
@@ -880,6 +865,78 @@
                             </div>
                             
                             <button type="button" id="save-backtest-params-btn" class="btn btn-primary" style="padding:6px 16px; font-size:12px; margin-top: 16px;" aria-label="保存回测配置">保存配置</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- 选股参数配置页面 -->
+                <div id="selection-config-page" class="page">
+                    <div class="card">
+                        <div class="card-body">
+                            <h4 style="margin:0 0 16px; color:#111827;">选股参数（策略持有决策）</h4>
+                            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(200px, 1fr)); gap:16px; margin-bottom:24px;">
+                                <div>
+                                    <label for="sel-short-days" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">短线观察期(交易日)</label>
+                                    <input type="number" id="sel-short-days" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="1" placeholder="如 3" aria-label="短线观察期">
+                                </div>
+                                <div>
+                                    <label for="sel-mid-days" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">中线观察期(交易日)</label>
+                                    <input type="number" id="sel-mid-days" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="1" placeholder="如 5" aria-label="中线观察期">
+                                </div>
+                                <div>
+                                    <label for="sel-long-days" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">长线观察期(交易日)</label>
+                                    <input type="number" id="sel-long-days" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="1" placeholder="如 10" aria-label="长线观察期">
+                                </div>
+                                <div>
+                                    <label for="sel-abandon-threshold" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">舍弃评分阈值(0-100)</label>
+                                    <input type="number" id="sel-abandon-threshold" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="0" max="100" step="1" placeholder="如 60" aria-label="舍弃评分阈值">
+                                </div>
+                            </div>
+                            <h5 style="margin:0 0 12px; color:#374151; font-size:13px;">技术面负面指标（评分扣分 / 卖出信号）</h5>
+                            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(150px, 1fr)); gap:12px; margin-bottom:24px;">
+                                <div>
+                                    <label for="neg-break-score" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">破位扣分</label>
+                                    <input type="number" id="neg-break-score" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" step="1" placeholder="如 -20" aria-label="破位扣分">
+                                </div>
+                                <div>
+                                    <label for="neg-off5-pct" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">离5日线阈值(%)</label>
+                                    <input type="number" id="neg-off5-pct" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="0.5" placeholder="如 10" aria-label="离5日线阈值">
+                                </div>
+                                <div>
+                                    <label for="neg-off5-score" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">离5日线扣分</label>
+                                    <input type="number" id="neg-off5-score" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" step="1" placeholder="如 -20" aria-label="离5日线扣分">
+                                </div>
+                                <div>
+                                    <label for="neg-overboll-pct" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">超布林上轨阈值(%)</label>
+                                    <input type="number" id="neg-overboll-pct" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="0.5" placeholder="如 10" aria-label="超布林上轨阈值">
+                                </div>
+                                <div>
+                                    <label for="neg-overboll-score" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">超布林上轨扣分</label>
+                                    <input type="number" id="neg-overboll-score" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" step="1" placeholder="如 -15" aria-label="超布林上轨扣分">
+                                </div>
+                                <div>
+                                    <label for="neg-stagnation-pct" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">放量滞涨涨幅阈值(%)</label>
+                                    <input type="number" id="neg-stagnation-pct" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="0" step="0.5" placeholder="如 2" aria-label="放量滞涨涨幅阈值">
+                                </div>
+                                <div>
+                                    <label for="neg-stagnation-score" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">放量滞涨扣分</label>
+                                    <input type="number" id="neg-stagnation-score" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" step="1" placeholder="如 -20" aria-label="放量滞涨扣分">
+                                </div>
+                                <div>
+                                    <label for="neg-bigdrop-pct" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">放量大跌跌幅阈值(%)</label>
+                                    <input type="number" id="neg-bigdrop-pct" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="0.5" placeholder="如 3" aria-label="放量大跌跌幅阈值">
+                                </div>
+                                <div>
+                                    <label for="neg-bigdrop-score" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">放量大跌扣分</label>
+                                    <input type="number" id="neg-bigdrop-score" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" step="1" placeholder="如 -30" aria-label="放量大跌扣分">
+                                </div>
+                                <div>
+                                    <label for="neg-vol-mult" style="font-size:12px; font-weight:600; color:#374151; display:block; margin-bottom:5px;">放量判定倍数</label>
+                                    <input type="number" id="neg-vol-mult" style="width:100%; padding:6px; border:1px solid #d1d5db; border-radius:4px; font-size:12px;" min="1" step="0.1" placeholder="如 1.5" aria-label="放量判定倍数">
+                                </div>
+                            </div>
+                            <button type="button" id="save-selection-config-btn" class="btn btn-primary" style="padding:6px 16px; font-size:12px;" aria-label="保存选股参数">保存选股参数</button>
+                            <p id="sel-config-msg" style="font-size:12px; margin-top:12px; color:#6b7280;"></p>
                         </div>
                     </div>
                 </div>
@@ -1416,6 +1473,44 @@
                             </div>
                         </div>
 
+                        <!-- 强弱共振分析 -->
+                        <div class="card" id="score-strength-card" style="display:none; margin-top:16px;">
+                            <div class="analysis-header" style="padding:16px; background:var(--card-bg); border-radius:12px 12px 0 0; box-shadow:0 1px 3px rgba(0,0,0,0.1);">
+                                <h3 style="margin:0; font-size:16px; color:var(--text-color);">⚖️ 强弱共振分析</h3>
+                                <div style="font-size:12px; color:#6b7280; margin-top:4px;">多维共振：趋势 / 量能 / 动量 / 相对强弱（走弱判定 / 走强判定）</div>
+                            </div>
+                            <div class="analysis-grid" id="strength-grid" style="display:grid; grid-template-columns:1fr 1fr; gap:16px; padding:16px;">
+                                <!-- 走弱标志 -->
+                                <div class="analysis-card" id="card-weak-signal" style="border:1px solid #fecaca; border-radius:8px; padding:14px;">
+                                    <h4 style="margin:0 0 10px; font-size:14px;">📉 走弱标志</h4>
+                                    <div class="metric-row"><span class="metric-label">等级</span><span id="weak-level" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">走弱得分</span><span id="weak-score" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">方向</span><span id="weak-trend-bear" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">走弱真伪</span><span id="weak-falsify" class="metric-value">--</span></div>
+                                    <div style="margin-top:8px; font-size:12px; color:#555;">
+                                        <span class="metric-label">信号</span>
+                                        <div id="weak-signals" style="margin-top:4px; line-height:1.6;">--</div>
+                                    </div>
+                                </div>
+                                <!-- 走强标志 -->
+                                <div class="analysis-card" id="card-strong-signal" style="border:1px solid #bbf7d0; border-radius:8px; padding:14px;">
+                                    <h4 style="margin:0 0 10px; font-size:14px;">📈 走强标志</h4>
+                                    <div class="metric-row"><span class="metric-label">等级</span><span id="strong-level" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">走强得分</span><span id="strong-score" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">方向</span><span id="strong-trend-up" class="metric-value">--</span></div>
+                                    <div class="metric-row"><span class="metric-label">走强真伪</span><span id="strong-confirm" class="metric-value">--</span></div>
+                                    <div style="margin-top:8px; font-size:12px; color:#555;">
+                                        <span class="metric-label">信号</span>
+                                        <div id="strong-signals" style="margin-top:4px; line-height:1.6;">--</div>
+                                    </div>
+                                </div>
+                                <!-- 中性（无明确方向）提示 -->
+                                <div id="strength-neutral" style="display:none; grid-column:1/-1; border:1px dashed #cbd5e1; border-radius:8px; padding:18px; text-align:center; color:#6b7280;">
+                                    ⚖️ 暂无明显强弱信号：趋势方向未定（多空平衡），走弱/走强判定均未触发，建议观望。
+                                </div>
+                            </div>
+                        </div>
+
                         <!-- 五维度评分卡片网格 -->
                         <div class="analysis-grid score-dimension-grid" role="region" aria-label="五维度评分详情">
 
@@ -1597,74 +1692,63 @@
                 </div>
                 
                 <!-- 选股排名页 -->
-                <div id="stock-ranking-page" class="page">
+                <div id="selection-track-page" class="page">
                     <div class="card">
                         <div class="card-body">
-                            <div class="form-row" style="margin-bottom: 20px;">
-                                <div class="form-group" style="flex: 0 0 auto; width: 120px;">
-                                    <label for="stock-ranking-date">选股日期</label>
-                                    <input type="date" id="stock-ranking-date" class="form-control" style="width: 100%; padding: 6px 4px; font-size: 13px;">
-                                </div>
-                                <div class="form-group" style="flex: 0 0 auto;">
-                                    <label style="display: block; height: 1px; opacity: 0;">生成</label>
-                                    <button class="btn btn-primary" id="generate-ranking-btn">
-                                        <span id="generate-btn-text">生成排名</span>
-                                        <span id="generate-loading" class="loading-spinner" style="display:none;">⏳</span>
-                                    </button>
-                                </div>
-                                <div class="form-group" style="flex: 0 0 auto;">
-                                    <label style="display: block; height: 1px; opacity: 0;">重新生成</label>
-                                    <button class="btn btn-danger" id="force-regenerate-ranking-btn" title="强制重新计算所有股票的评分">
-                                        <span id="force-regenerate-btn-text">重新生成</span>
-                                        <span id="force-regenerate-loading" class="loading-spinner" style="display:none;">⏳</span>
-                                    </button>
-                                </div>
-                            </div>
-                            
-                            <!-- 结果区域 -->
-                            <div id="stock-ranking-result">
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                
-                <!-- 排名跟踪页 -->
-                <div id="ranking-track-page" class="page">
-                    <div class="card">
-                        <div class="card-body">
-                            <div class="form-row" style="margin-bottom: 20px;">
-                                <div class="form-group">
-                                    <label for="ranking-track-date">选股日期</label>
-                                    <input type="date" id="ranking-track-date" class="form-control">
-                                </div>
-                                <div class="form-group">
-                                    <label for="ranking-track-topn">Top N</label>
-                                    <select id="ranking-track-topn" class="form-control">
-                                        <option value="5">Top 5</option>
-                                        <option value="10">Top 10</option>
-                                        <option value="20">Top 20</option>
-                                        <option value="50">Top 50</option>
+                            <!-- 筛选区（非必选） -->
+                            <div class="form-row" style="margin-bottom:20px; display:flex; flex-wrap:wrap; gap:12px; align-items:flex-end;">
+                                <div class="form-group" style="flex:0 0 auto; min-width:130px;">
+                                    <label for="track-status-filter">持有状态</label>
+                                    <select id="track-status-filter" class="form-control" style="width:100%;">
+                                        <option value="">全部</option>
+                                        <option value="holding">持有</option>
+                                        <option value="sold">卖出</option>
                                     </select>
                                 </div>
-                                <div class="form-group">
-                                    <label for="ranking-track-sort">排序字段</label>
-                                    <select id="ranking-track-sort" class="form-control">
+                                <div class="form-group" style="flex:0 0 auto; min-width:170px;">
+                                    <label for="track-strategy-filter">策略名称</label>
+                                    <select id="track-strategy-filter" class="form-control" style="width:100%;">
+                                        <option value="">全部策略</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" style="flex:0 0 auto; min-width:150px;">
+                                    <label for="track-stock-name">股票名称</label>
+                                    <input type="text" id="track-stock-name" class="form-control" placeholder="模糊查询" style="width:100%;">
+                                </div>
+                                <div class="form-group" style="flex:0 0 auto; min-width:140px;">
+                                    <label for="track-sort-by">排序字段</label>
+                                    <select id="track-sort-by" class="form-control" style="width:100%;">
                                         <option value="yield" selected>收益率（默认）</option>
-                                        <option value="strategy">入选策略名称</option>
+                                        <option value="strategy">策略名</option>
                                     </select>
                                 </div>
-                                <div class="form-group">
-                                    <label style="display: block; height: 1px; opacity: 0;">跟踪</label>
-                                    <button class="btn btn-primary" id="track-ranking-btn">
-                                        <span id="track-btn-text">排名跟踪</span>
-                                        <span id="track-loading" class="loading-spinner" style="display:none;">⏳</span>
+                                <div class="form-group" style="flex:0 0 auto; min-width:100px;">
+                                    <label for="track-sort-order">排序方向</label>
+                                    <select id="track-sort-order" class="form-control" style="width:100%;">
+                                        <option value="desc" selected>降序</option>
+                                        <option value="asc">升序</option>
+                                    </select>
+                                </div>
+                                <div class="form-group" style="flex:0 0 auto;">
+                                    <label style="display:block; height:1px; opacity:0;">查询</label>
+                                    <button class="btn btn-primary" id="track-query-btn">
+                                        <span id="track-query-btn-text">查询</span>
+                                        <span id="track-query-loading" class="loading-spinner" style="display:none;">⏳</span>
+                                    </button>
+                                </div>
+                                <div class="form-group" style="flex:0 0 auto;">
+                                    <label style="display:block; height:1px; opacity:0;">重新生成</label>
+                                    <button class="btn btn-danger" id="track-regenerate-btn" title="重新计算当前持有标的的评分、强弱标志与卖出信号">
+                                        <span id="track-regenerate-btn-text">重新生成</span>
+                                        <span id="track-regenerate-loading" class="loading-spinner" style="display:none;">⏳</span>
                                     </button>
                                 </div>
                             </div>
-                            
+
                             <!-- 结果区域 -->
-                            <div id="ranking-track-result">
-                            </div>
+                            <div id="selection-track-result"></div>
+                            <div id="selection-track-stats" style="display:none; margin-top:16px; padding:12px; background:#f9fafb; border-radius:8px; border-left:4px solid #3b82f6; font-size:13px; color:#374151;"></div>
+                            <div id="selection-track-pagination" style="display:none; margin-top:16px; text-align:center;"></div>
                         </div>
                     </div>
                 </div>
@@ -1806,11 +1890,12 @@
                 <h3 id="stock-detail-modal-title">股票详情</h3>
                 <button class="close-btn" onclick="closeModal()">&times;</button>
             </div>
-            <div class="modal-body">
-                <div id="stock-chart-container" class="stock-chart-container">
+            <div class="modal-body" style="display:flex; gap:16px; align-items:flex-start; overflow-y:auto;">
+                <div id="stock-chart-container" class="stock-chart-container" style="flex:1; margin-bottom:0; min-width:0;">
                     <canvas id="stock-chart"></canvas>
                 </div>
-                <div class="stock-info" id="stock-info"></div>
+                <div id="stock-change-list" class="stock-change-list" style="display:none;"></div>
+                <div class="stock-info" id="stock-info" style="flex:1;"></div>
             </div>
         </div>
     </div>
@@ -1984,8 +2069,9 @@
     </div>
 
     <script src="/static/js/dashboard_stats.js"></script>
-    <script type="module" src="/static/js/app.js?v=19"></script>
-    <script src="/static/js/kline_chart.js"></script>
+    <script type="module" src="/static/js/app.js?v=22"></script>
+    <script src="/static/js/lib/echarts.min.js?v=1"></script>
+    <script src="/static/js/kline_chart.js?v=9"></script>
     <script src="/static/js/init_simple.js?v=2"></script>
     <script src="/static/js/trading.js"></script>
     <script src="/static/js/data_update.js"></script>

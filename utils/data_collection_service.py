@@ -688,6 +688,24 @@ class DataCollectionService:
         # 生成任务ID
         task_id = f"UPDATE_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         
+        # 【退市股治理】数据更新前刷新退市股黑名单并清理库中新出现的退市股数据
+        # 保证每次日常"点更新"都顺带让退市股黑名单保持最新（缺失/过期自动从 Tushare 刷新），
+        # 并清掉在更新期间新退市的股票数据（避免退市股数据被再次拉取/入库）。
+        try:
+            from utils.delisted_stocks import load_delisted_stocks
+            delisted = load_delisted_stocks(max_age_days=1)
+            if delisted:
+                ph = ','.join(['?'] * len(delisted))
+                extra = list(delisted)
+                self.db_manager.execute(f'DELETE FROM stock_basic WHERE code IN ({ph})', extra)
+                self.db_manager.execute(f'DELETE FROM stock_kline WHERE code IN ({ph})', extra)
+                conn = self.db_manager.connect()
+                conn.commit()
+                conn.close()
+                logger.info(f"数据更新前已刷新退市股黑名单({len(delisted)}只)并清理库内退市股数据")
+        except Exception as e:
+            logger.warning(f"数据更新前刷新退市股黑名单失败: {e}")
+        
         # 在后台线程中执行更新
         thread = threading.Thread(
             target=self._run_update,

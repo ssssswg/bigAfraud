@@ -220,21 +220,9 @@ class EventScorer:
             return ""
 
     def _get_pro(self):
-        """
-        获取 Tushare pro API 实例（延迟初始化）
-
-        返回:
-            tushare pro API 对象
-        """
+        """获取 Tushare pro API 实例（延迟初始化；统一走 utils.tushare_client.get_pro，镜像+全局限流）"""
         if self._pro is None:
-            try:
-                import tushare as ts
-                # 使用 token 初始化 pro API
-                self._pro = get_pro(self._token)
-                logger.debug("Tushare pro API 初始化成功")
-            except Exception as e:
-                logger.error(f"Tushare pro API 初始化失败: {e}")
-                raise
+            self._pro = get_pro(self._token)
         return self._pro
 
     def _convert_ts_code(self, stock_code: str) -> str:

@@ -89,9 +89,9 @@ class MainUptrendDipBuyStrategy(BaseStrategy):
         ma_period = int(self.params['ma_period'])
         vol_period = int(self.params['volume_ma_period'])
 
-        # 均线（含当日收盘）
-        result['ma'] = result['close'].rolling(
-            window=ma_period, min_periods=1).mean()
+        # 均线（含当日收盘，官方优先）
+        from utils import technical as _tech
+        result['ma'] = _tech.ma_norm(result, ma_period)
         # 量比均量（不含当日，用于展示）
         result['vol_ma'] = result['volume'].shift(1).rolling(
             window=vol_period, min_periods=1).mean()

@@ -86,10 +86,9 @@ class LowTD9Strategy(BaseStrategy):
 
         result = df.copy()
 
-        # 倒序数据：转正序计算均线，再恢复倒序
-        close_reversed = result['close'].iloc[::-1]
-        ma60_reversed = close_reversed.rolling(window=60, min_periods=1).mean()
-        result['ma60'] = ma60_reversed.iloc[::-1].values
+        # 倒序数据：官方优先，顺序无关（内部自动检测并正确化）
+        from utils import technical as _tech
+        result['ma60'] = _tech.ma_norm(result, 60)
 
         return result
 

@@ -54,15 +54,16 @@ async function loadModules() {
         const analysisModule = await import('./modules/analysis.js');
         const strategiesModule = await import('./modules/strategies.js');
         const historyModule = await import('./modules/history.js?v=15');
-        const rankingModule = await import('./modules/ranking.js?v=19');
+        const rankingModule = await import('./modules/ranking.js?v=20');
         const utilsModule = await import('./modules/utils.js');
         const backtestModule = await import('./modules/backtest.js');
-        const backtestBatchModule = await import('./modules/backtest-batch.js');
+        const backtestBatchModule = await import('./modules/backtest-batch.js?v=3');
         const backtestExecutorModule = await import('./modules/backtest-executor.js');
         const marketTempModule = await import('./modules/market_temperature.js');
         const moneyFlowModule = await import('./modules/money_flow.js');
         const strategyRunnerModule = await import('./modules/strategy-runner.js');
         const riskModule = await import('./modules/risk.js');
+        const selectionConfigModule = await import('./modules/selection-config.js');
         
         // 存储模块
         modules = {
@@ -81,7 +82,8 @@ async function loadModules() {
             marketTemp: marketTempModule,
             moneyFlow: moneyFlowModule,
             strategyRunner: strategyRunnerModule,
-            risk: riskModule
+            risk: riskModule,
+            selectionConfig: selectionConfigModule
         };
         
         // 初始化
@@ -121,6 +123,9 @@ async function initializeApp() {
     
     // 初始化风控模块
     modules.risk.initRiskModule();
+    
+    // 初始化选股参数配置
+    modules.selectionConfig.initSelectionConfig();
     
     // 注：策略执行器模块在 navigation.js 中懒加载（用户切换到策略运行器页面时才初始化）
     

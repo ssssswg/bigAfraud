@@ -70,15 +70,12 @@ class OversoldReboundStrategy(BaseStrategy):
         :return: 新增 dif/dea/macd 三列的 DataFrame
         """
         df = df.copy()  # 避免修改原始数据
-        close = df['close']  # 直接基于收盘价序列计算
-        # 快线与慢线指数移动平均
-        ema_fast = close.ewm(span=self.params['macd_fast'], adjust=False).mean()
-        ema_slow = close.ewm(span=self.params['macd_slow'], adjust=False).mean()
-        dif = ema_fast - ema_slow  # DIF = 快线 - 慢线
-        dea = dif.ewm(span=self.params['macd_signal'], adjust=False).mean()  # 信号线
-        df['dif'] = dif
-        df['dea'] = dea
-        df['macd'] = dif - dea  # MACD柱 = DIF - DEA
+        # 快线与慢线指数移动平均（官方优先；内部自动检测倒序并正确化，修正原倒序 ewm 方向问题）
+        from utils import technical as _tech
+        _macd = _tech.MACD(df, self.params['macd_fast'], self.params['macd_slow'], self.params['macd_signal'])
+        df['dif'] = _macd['macd']
+        df['dea'] = _macd['macd_signal']
+        df['macd'] = _macd['macd'] - _macd['macd_signal']  # MACD柱 = DIF - DEA（1×）
         return df
 
     # ------------------------------------------------------------------ #

@@ -115,7 +115,6 @@ from utils.kline_initializer import KlineInitializer
 import sys
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
-from stock_analyzer import StockAnalyzer
 from utils.strategy_name_mapper import STRATEGY_NAME_MAP, get_chinese_name
 
 app = Flask(__name__, 
@@ -150,6 +149,309 @@ logger.info("=" * 60)
 
 # 市场情绪当日缓存（高开低走动态阈值用）：date/up_ratio/status
 _market_sentiment_cache = {'date': None, 'up_ratio': None, 'status': None}
+# ==================== 多进程并行选股（fork 继承 stock_data/官方因子/指标缓存） ====================
+DIP_STRATEGIES = {'OversoldReboundStrategy', 'WBottomStrategy', 'LimitUpPullbackStrategy',
+                  'MainUptrendDipBuyStrategy', 'LowTD9Strategy', 'MorningStarStrategy',
+                  'BottomTrendInflectionStrategy'}
+_MP_STOCK_DATA = None
+_MP_STOCK_NAMES = {}
+_MP_DISPLAY = {}
+_MP_REGISTRY = None
+import logging as _logging
+_MP_LOGGER = _logging.getLogger(__name__)
+
+def _get_market_sentiment(trade_date):
+    """当日市场情绪风向：上涨家数占比 up_ratio(0~1)。本地 market_temperature 表优先；
+    无则 MarketTemperature 实时计算(DB缓存兜底)；失败回退 0.5(正常)。同日模块级缓存。"""
+    global _market_sentiment_cache
+    key = str(trade_date)
+    if _market_sentiment_cache.get('date') == key:
+        return _market_sentiment_cache
+    up_ratio, status = None, None
+    try:
+        from trading.market_temperature_dao import MarketTemperatureDAO
+        row = MarketTemperatureDAO().query_by_date(key)
+        if row:
+            up = row.get('up_count') or 0
+            down = row.get('down_count') or 0
+            if up + down > 0:
+                up_ratio = up / (up + down)
+                status = row.get('status')
+    except Exception:
+        pass
+    if up_ratio is None:
+        try:
+            from utils.market_temperature import MarketTemperature
+            d = MarketTemperature().calculate(key, use_cache=True, skip_risk_eval=True)
+            up = d.get('up_count') or 0
+            down = d.get('down_count') or 0
+            if up + down > 0:
+                up_ratio = up / (up + down)
+                status = d.get('status')
+        except Exception:
+            pass
+    if up_ratio is None:
+        up_ratio, status = 0.5, '正常'
+    _market_sentiment_cache = {'date': key, 'up_ratio': up_ratio, 'status': status}
+    return _market_sentiment_cache
+
+def _position_score(code, df, strategy_name=''):
+    """每策略多选时，按股价位置+主力行为+强者恒强+龙头多一条命打分选1。
+    加分：月线低位、距120日高点回撤大(低吸)、站上关键均线+近5日创新高(强者恒强)、连板涨停(龙头多一条命)
+    减分：20日涨幅大(兑现)、量能比>3(巨量出货)、高开>3%(高开兑现)、乖离>10%(兑现回调风险)
+    低吸类策略(strategy_name in DIP_STRATEGIES)跳过强者恒强豁免与弱态扣分。"""
+    try:
+        import pandas as pd
+        latest = df.iloc[0]
+        close = latest['close']
+        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
+
+        # ===== 位置看月线（低位加分/高位减分）=====
+        pos_score = 0.0
+        try:
+            d = df.iloc[::-1].reset_index(drop=True)
+            monthly = d.resample('ME', on='date').agg({'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
+            if len(monthly) >= 6:
+                m_high = monthly['high'].tail(12).max()
+                m_low = monthly['low'].tail(12).min()
+                if m_high > m_low:
+                    month_pos = (close - m_low) / (m_high - m_low)
+                    pos_score = 60 * (0.5 - month_pos) if month_pos < 0.5 else -50 * (month_pos - 0.5)
+        except Exception:
+            pos_score = 0.0
+
+        # ===== 日线低吸机会（距120日高点回撤）=====
+        high120 = df.head(120)['high'].max()
+        drawdown = (high120 - close) / high120 if high120 > 0 else 0
+        dd_score = drawdown * 30
+
+        # ===== 20日涨幅（越大越接近兑现）=====
+        base = df.head(20)['close'].iloc[-1] if len(df) >= 20 else prev_close
+        rise20 = (close - base) / base if base > 0 else 0
+        rise_penalty = -rise20 * 60
+
+        # ===== 乖离率：距5日线/布林上轨>10% 兑现回调风险 =====
+        ma5 = df.head(5)['close'].mean()
+        ma20c = df.head(20)['close'].mean()
+        std20 = df.head(20)['close'].std()
+        boll_up = ma20c + 2 * std20
+        gap_ma5 = (close - ma5) / ma5 if ma5 > 0 else 0
+        gap_boll = (close - boll_up) / boll_up if boll_up and boll_up > 0 else 0
+        deviate_penalty = 0.0
+        if abs(gap_ma5) > 0.10:
+            deviate_penalty += -40
+        if gap_boll and gap_boll > 0.10:
+            deviate_penalty += -40
+
+        # ===== 强者恒强加分（站上关键均线+近5日创新高）=====
+        ma10 = df.head(10)['close'].mean()
+        ma20v = df.head(20)['close'].mean()
+        strength = 0.0
+        if close > ma5: strength += 5
+        if close > ma10: strength += 5
+        if close > ma20v: strength += 5
+        high6 = df.head(6)['high'].max()
+        if high6 > 0 and close >= high6:
+            strength += 10  # 近5日创新高，强者恒强
+
+        # ===== 龙头多一条命（近5日涨停/连板天数，提供风险容差）=====
+        limit_days = 0
+        try:
+            d2 = df.iloc[::-1].reset_index(drop=True)
+            for i in range(len(d2) - 1, max(len(d2) - 6, 0), -1):
+                pc = d2['close'].iloc[i - 1]
+                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
+                    limit_days += 1
+        except Exception:
+            limit_days = 0
+        strength += min(limit_days, 3) * 8  # 连板=龙头多一条命
+
+        # ===== 龙头容差：强者/龙头适当抵消高位与乖离惩罚 =====
+        tolerance = min(strength, 20) * 0.5
+
+        # ===== 放巨量滞涨=出货；放量上涨=强势（不设高开惩罚：盘后选股高开已无意义）=====
+        v5 = df.head(5)['volume'].mean()
+        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
+        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
+        trap_penalty = 0.0
+        if vol_ratio > 3 and chg < 0.01:
+            trap_penalty = -60  # 放巨量但滞涨/收阴=主力出货
+        elif vol_ratio > 1.5 and chg > 0.03:
+            trap_penalty = 10  # 放量上攻=强者恒强
+
+        # ===== 强者恒强豁免：持续创新高 + 量价健康（无加速/出货）→ 位置高低影响不大 =====
+        # 用户平衡：个股足够强势（不断破新高）且没有加速和出货迹象，位置高不应重扣；
+        # 但加速赶顶（5日涨幅过猛）或出货（巨量滞涨）仍照扣（兑现风险）。
+        try:
+            if strategy_name not in DIP_STRATEGIES:  # 低吸类不套用强者恒强豁免
+                rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
+                high20 = df.head(20)['high'].max()
+                creating_new_high = high20 > 0 and close >= high20  # 收盘创近20日新高（持续破新高）
+                healthy = (
+                    vol_ratio < 5                      # 无明显极端放量
+                    and not (vol_ratio > 3 and chg < 0.01)  # 非巨量滞涨（出货）
+                    and rise5 < 0.25                    # 5日未涨超25%（无加速赶顶）
+                )
+                if creating_new_high and strength >= 15 and healthy:
+                    if pos_score < 0:                    # 只弱化高位扣分，低位加分不动
+                        pos_score = pos_score * 0.3
+                    rise_penalty = rise_penalty * 0.5    # 20日涨幅兑现惩罚减半
+                    deviate_penalty = deviate_penalty * 0.3  # 乖离容忍（强者不惧偏离）
+        except Exception:
+            pass
+
+        # ===== 该强不强就是弱：本应走强却走弱 → 扣分（弱势股及时抽身）=====
+        try:
+            weak = 0.0
+            if strategy_name not in DIP_STRATEGIES:  # 低吸类买的就是弱转强，不套用弱态扣分
+                if vol_ratio > 1.5 and chg < 0:        # 放量却收阴/平盘=量给了没涨（该强不强）
+                    weak -= 25
+                if limit_days > 0 and chg < -0.01 and vol_ratio > 1.5:  # 放量断板走弱（缩量回调=健康回踩）
+                    weak -= 15
+                recent_close_max = df.head(3)['close'].max()
+                if high20 > 0 and recent_close_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:  # 放量冲高未破回落至5日线下
+                    weak -= 20
+        except Exception:
+            weak = 0.0
+
+        # ===== 打分=小建议（排序用）：强者恒强加分 + 位置/涨幅/乖离风险修正 + 弱态/出货小扣 =====
+        # 核心信号由策略规则 + 假信号过滤承担，打分仅决定"每策略多选时选哪 1 只"
+        if strategy_name in DIP_STRATEGIES:
+            # 低吸类：位置主导（买弱转强，低位低吸优先）
+            score = pos_score + dd_score + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
+        else:
+            # 顺势/追强类：强度优先（强者恒强），位置仅轻量修正（×0.5）
+            score = pos_score * 0.5 + dd_score * 0.5 + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
+        return round(score, 2)
+    except Exception:
+        return -9999
+
+def _is_fake_signal(code, df, strategy_name):
+    """规则层假信号规避（主力阴招）：策略命中后剔除假信号，核心信号规则之一。
+    全局：放巨量滞涨(出货)、高开低走(高开兑现回落)
+    追强类额外：加速赶顶(5日涨超25%)、乖离过大(>15%)、放量假突破(突破20日高回落MA5下)、放量断板大跌
+    低吸类不排除假突破/加速/乖离（买入点即回调/低位）"""
+    try:
+        latest = df.iloc[0]
+        close = latest['close']
+        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
+        open_p = latest['open'] if 'open' in latest else close
+        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
+        v5 = df.head(5)['volume'].mean()
+        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
+        ma5 = df.head(5)['close'].mean()
+        is_dip = strategy_name in DIP_STRATEGIES
+        # 全局：放巨量滞涨=出货
+        if vol_ratio > 3 and chg < 0.01:
+            return True, '放巨量滞涨(出货)'
+        # 高开低走需分辨（量价二维 + 市场情绪动态阈值，避免极端行情误杀跟跌）：
+        #  · 市场情绪动态阈值：极端普跌(涨家占比<0.3)→放宽8%(个股多为跟跌，非独立出货)；偏强(>0.6)→收紧4%(独立跌=真出货)；正常→5%
+        #  · 量能主动分档（缩量=洗盘特征/放量=出货特征）：
+        #      - 明显缩量(量比<1.0)=无量下杀，非主力派发→洗盘，仅极端下杀(跌幅>阈值+3%或>10%)算出货
+        #      - 温和量(1.0~1.5)=按市场情绪动态阈值判断
+        #      - 明显放量(量比>1.5)=主力借高开派发→跌破MA5 或 跌幅超阈值 即算出货
+        #  · 其余（缩量温和回落 / 守住MA5 / 跌幅小）= 洗盘（无量回踩浮筹，之后仍可能拉升）→ 保留
+        if prev_close > 0 and (open_p / prev_close - 1) > 0.03 and close < prev_close:
+            day_drop = (prev_close - close) / prev_close
+            try:
+                _td = str(df['date'].iloc[0]).replace('-', '')
+                _up_ratio = _get_market_sentiment(_td).get('up_ratio', 0.5)
+            except Exception:
+                _up_ratio = 0.5
+            if _up_ratio < 0.3:
+                drop_thresh = 0.08
+            elif _up_ratio > 0.6:
+                drop_thresh = 0.04
+            else:
+                drop_thresh = 0.05
+            if vol_ratio < 1.0:
+                # 明显缩量=洗盘特征，仅极端下杀(超市场阈值+3%或>10%)才算出货
+                if day_drop > max(drop_thresh + 0.03, 0.10):
+                    return True, '高开低走(缩量极端下杀)'
+            elif vol_ratio > 1.5:
+                # 明显放量=出货特征，跌破MA5 或 跌幅超阈值 即剔
+                if close < ma5 or day_drop > drop_thresh:
+                    return True, '高开低走(放量出货)'
+            else:
+                # 温和量(1.0~1.5)：按市场情绪动态阈值
+                if day_drop > drop_thresh:
+                    return True, '高开低走(出货)'
+        if is_dip:
+            return False, ''
+        # 追强类：加速赶顶（多维，不只5日涨幅）——龙头策略豁免（连板加速是龙头常态）
+        #  主信号：5日涨幅>25% 或 10日涨幅>40%（补10日维度，防单日跳空虚高漏判/误判）
+        #  确认（任一）：放量(量比>1.5)、乖离MA20>15%、高位(距120日高点回撤<10%)
+        #  排除：缩量+低乖离+非高位的健康上行（强者恒强，不误杀）
+        rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
+        rise10 = (close / df.head(10)['close'].iloc[-1] - 1) if len(df) >= 11 else 0
+        if strategy_name != 'LeaderStrategy' and (rise5 >= 0.25 or rise10 >= 0.40):
+            _ma20v = df.head(20)['close'].mean()
+            _bias20 = (close - _ma20v) / _ma20v if _ma20v > 0 else 0
+            _high120 = df.head(120)['high'].max()
+            _near_high = _high120 > 0 and (_high120 - close) / _high120 < 0.10
+            if vol_ratio > 1.5 or _bias20 > 0.15 or _near_high:
+                return True, '加速赶顶(短期涨幅过大+放量/乖离/高位)'
+        # 追强类：乖离过大（距MA5>15%，随时兑现）——龙头策略豁免
+        if strategy_name != 'LeaderStrategy' and ma5 > 0 and (close - ma5) / ma5 > 0.15:
+            return True, '乖离过大(>15%)'
+        # 追强类：放量假突破（近3日曾触20日新高，今日放量跌破MA5=突破失败）
+        high20 = df.head(20)['high'].max()
+        recent_max = df.head(3)['close'].max()
+        if high20 > 0 and recent_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:
+            return True, '放量假突破'
+        # 追强类：放量断板大跌（近2日有涨停，今日放量跌>5%=断板出货）
+        try:
+            d2 = df.iloc[::-1].reset_index(drop=True)
+            has_limit = False
+            for i in range(len(d2) - 1, max(len(d2) - 3, 0), -1):
+                pc = d2['close'].iloc[i - 1]
+                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
+                    has_limit = True
+                    break
+            if has_limit and chg < -0.05 and vol_ratio > 1.5:
+                return True, '放量断板大跌'
+        except Exception:
+            pass
+        return False, ''
+    except Exception:
+        return False, ''
+
+def _run_strategy(sname):
+    sobj = _MP_REGISTRY.get_strategy(sname)
+    s_display = _MP_DISPLAY.get(sname, sname)
+    sigs = []
+    errs = 0
+    t0 = dt.now()
+    for code, (name, df) in _MP_STOCK_DATA.items():
+        try:
+            r = sobj.analyze_stock(code, name, df)
+            if r:
+                fake, fake_reason = _is_fake_signal(code, df, sname)
+                if fake:
+                    _MP_LOGGER.info(f"策略 {sname} 剔除假信号 {code} {name}: {fake_reason}")
+                    continue
+                sigs.append({
+                    'code': r['code'],
+                    'name': r.get('name', _MP_STOCK_NAMES.get(code, '未知')),
+                    'signals': r['signals'],
+                    'strategy_display_name': s_display
+                })
+        except Exception:
+            errs += 1
+    # 每策略最多1只：按股价位置/主力行为打分选最优（逆人性低吸优先）
+    if len(sigs) > 1:
+        scored = []
+        for _s in sigs:
+            _df = _MP_STOCK_DATA.get(_s['code'], (None, None))[1]
+            _sc = _position_score(_s['code'], _df, sname) if _df is not None else -9999
+            scored.append((_sc, _s))
+        scored.sort(key=lambda x: -x[0])
+        sigs = [scored[0][1]]
+        _MP_LOGGER.info(f"策略 {sname} 命中 {len(scored)} 只，位置打分选1: {sigs[0]['code']} {sigs[0]['name']} (score={scored[0][0]})")
+
+    _MP_LOGGER.info(f"策略 {sname} 完成 - 选中 {len(sigs)} 只，耗时 {(dt.now()-t0).total_seconds():.1f}秒")
+    return sname, sigs, errs
+
 
 
 # 初始化数据库（确保所有表都已创建）
@@ -173,7 +475,6 @@ registry = get_registry("config/strategy_params.yaml")
 # quant_system = QuantSystem("config/config.yaml")
 selection_record_manager = SelectionRecordManager()
 ranking_manager = RankingManager()
-stock_analyzer = StockAnalyzer()
 data_collection_service = get_data_collection_service("data")
 
 # 初始化K线初始化器
@@ -240,23 +541,30 @@ def get_stocks():
     try:
         # 获取分页参数
         page = int(request.args.get('page', 1))
-        per_page = int(request.args.get('per_page', 500))  # 默认每页500只
-        
+        per_page = int(request.args.get('per_page', 100))  # 默认每页100只
+        keyword = (request.args.get('keyword') or '').strip()
+        page = max(page, 1)
+        per_page = min(max(per_page, 1), 500)
+
         # 计算分页偏移
         offset = (page - 1) * per_page
-        
+
+        # keyword 模糊过滤（code/name，转义 LIKE 通配符防注入）
+        where = ''
+        params = []
+        if keyword:
+            like = '%' + keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_') + '%'
+            where = " WHERE code LIKE ? ESCAPE '\\' OR name LIKE ? ESCAPE '\\'"
+            params = [like, like]
+
         # 从 stock_basic 表获取总数
-        total_result = db_manager.query('SELECT COUNT(*) as count FROM stock_basic')
+        total_result = db_manager.query('SELECT COUNT(*) as count FROM stock_basic' + where, params)
         total = total_result[0]['count'] if total_result else 0
         
         # 从 stock_basic 表获取分页数据
-        query = '''
-            SELECT code, name, industry, area, market, list_date, market_cap
-            FROM stock_basic
-            ORDER BY code
-            LIMIT ? OFFSET ?
-        '''
-        basic_stocks = db_manager.query(query, (per_page, offset))
+        query = ('SELECT code, name, industry, area, market, list_date, market_cap '
+                 'FROM stock_basic' + where + ' ORDER BY code LIMIT ? OFFSET ?')
+        basic_stocks = db_manager.query(query, params + [per_page, offset])
         
         stock_list = []
         for stock in basic_stocks:
@@ -705,30 +1013,23 @@ def get_stock_detail(code):
         
         # 确保数据按日期升序排列（从早到晚）
         df = df.sort_values('date', ascending=True).reset_index(drop=True)
-        
-        # 计算KDJ指标
-        from utils.technical import KDJ
-        kdj_df = KDJ(df, n=9, m1=3, m2=3)
-        
-        # 转换为列表格式，返回最近100条数据
+
+        # 详情弹窗展示K线+MA+成交量，返回近2年（约480条）K线供前端缩放
         data = []
-        # 取最后100条（最新的数据）
-        start_idx = max(0, len(df) - 100)
+        # 取最后480条（约2年交易日）
+        start_idx = max(0, len(df) - 480)
         for i in range(start_idx, len(df)):
             row = df.iloc[i]
-            kdj_row = kdj_df.iloc[i]
+            date_str = row['date'].strftime('%Y-%m-%d')
             data.append({
-                'date': row['date'].strftime('%Y-%m-%d'),
+                'date': date_str,
                 'open': round(row['open'], 2) if pd.notna(row['open']) else None,
                 'high': round(row['high'], 2) if pd.notna(row['high']) else None,
                 'low': round(row['low'], 2) if pd.notna(row['low']) else None,
                 'close': round(row['close'], 2) if pd.notna(row['close']) else None,
                 'volume': int(row['volume']) if pd.notna(row['volume']) else 0,
-                'turnover': round(row.get('turnover', 0), 2) if 'turnover' in row and pd.notna(row.get('turnover')) else 0,
+                'turnover': 0,
                 'market_cap': round(row.get('market_cap', 0) / 1e8, 2) if 'market_cap' in row and pd.notna(row.get('market_cap')) else 0,  # 总市值，单位：亿
-                'K': round(kdj_row['K'], 2) if pd.notna(kdj_row['K']) else None,
-                'D': round(kdj_row['D'], 2) if pd.notna(kdj_row['D']) else None,
-                'J': round(kdj_row['J'], 2) if pd.notna(kdj_row['J']) else None
             })
         
         return jsonify({'success': True, 'code': code, 'data': data})
@@ -854,6 +1155,11 @@ def run_selection():
         logic = 'or'
         end_date = None
 
+        # 默认参数（GET 请求不解析 body，使用默认；POST 会覆盖，避免分支外引用未定义）
+        b1_match = False
+        min_similarity = 60.0
+        lookback_days = 25
+
         # 解析请求参数
         if request.method == 'POST':
             try:
@@ -925,7 +1231,18 @@ def run_selection():
         if not stock_data:
             func_logger.warning("没有可用的股票数据")
             return jsonify({'success': True, 'data': {}, 'time': dt.now().strftime('%Y-%m-%d %H:%M:%S')})
-        
+
+        # 批量预热全市场当日官方因子（选股提速核心：1 次请求替代逐只 400 天拉取）
+        try:
+            from utils import technical as _tech
+            _sample = next(iter(stock_data.values()), (None, None))[1]
+            _td = str(_sample['date'].max())[:10].replace('-', '') if _sample is not None and not _sample.empty else None
+            if _td:
+                _n = _tech.prefetch_official_factor_batch(trade_date=_td)
+                func_logger.info(f"批量预热官方因子完成，命中 {_n} 只（trade_date={_td}）")
+        except Exception as _e:
+            func_logger.warning(f"批量预热官方因子失败: {_e}")
+
         results = {}
         
         # AND逻辑：找出被所有选中策略都选中的股票
@@ -1041,312 +1358,25 @@ def run_selection():
                     all_strategy_names = list(registry.strategies.keys())
                     strategies_to_execute = [(name, registry.get_strategy(name)) for name in all_strategy_names if registry.get_strategy(name)]
                 
-                # 并行执行策略（使用线程池加速）
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                import os
+                # 并行执行策略（多进程池，fork 继承 stock_data/官方因子/指标缓存/registry，避开 GIL）
+                from concurrent.futures import ProcessPoolExecutor, as_completed
+                import os, multiprocessing as _mp
                 _max_workers = min(os.cpu_count() or 4, len(strategies_to_execute), 8)
 
-                # 逆势低吸类策略（买弱/买回调/买低位）：不适用"强者恒强豁免"与"该强不强"弱态扣分，
-                # 否则与策略初衷冲突（超跌/回踩/低位本就是"弱"状态）；保留位置/回撤/巨量滞涨等基础项。
-                DIP_STRATEGIES = {'OversoldReboundStrategy', 'WBottomStrategy', 'LimitUpPullbackStrategy',
-                                  'MainUptrendDipBuyStrategy', 'LowTD9Strategy', 'MorningStarStrategy',
-                                  'BottomTrendInflectionStrategy'}
+                # 每轮选股刷新每股指标缓存（跨策略复用技术指标，避免跨轮串扰）
+                from utils import technical as _tech_c
+                _tech_c.clear_indicator_cache()
 
-                def _get_market_sentiment(trade_date):
-                    """当日市场情绪风向：上涨家数占比 up_ratio(0~1)。本地 market_temperature 表优先；
-                    无则 MarketTemperature 实时计算(DB缓存兜底)；失败回退 0.5(正常)。同日模块级缓存。"""
-                    global _market_sentiment_cache
-                    key = str(trade_date)
-                    if _market_sentiment_cache.get('date') == key:
-                        return _market_sentiment_cache
-                    up_ratio, status = None, None
-                    try:
-                        from trading.market_temperature_dao import MarketTemperatureDAO
-                        row = MarketTemperatureDAO().query_by_date(key)
-                        if row:
-                            up = row.get('up_count') or 0
-                            down = row.get('down_count') or 0
-                            if up + down > 0:
-                                up_ratio = up / (up + down)
-                                status = row.get('status')
-                    except Exception:
-                        pass
-                    if up_ratio is None:
-                        try:
-                            from utils.market_temperature import MarketTemperature
-                            d = MarketTemperature().calculate(key, use_cache=True, skip_risk_eval=True)
-                            up = d.get('up_count') or 0
-                            down = d.get('down_count') or 0
-                            if up + down > 0:
-                                up_ratio = up / (up + down)
-                                status = d.get('status')
-                        except Exception:
-                            pass
-                    if up_ratio is None:
-                        up_ratio, status = 0.5, '正常'
-                    _market_sentiment_cache = {'date': key, 'up_ratio': up_ratio, 'status': status}
-                    return _market_sentiment_cache
-
-                def _position_score(code, df, strategy_name=''):
-                    """每策略多选时，按股价位置+主力行为+强者恒强+龙头多一条命打分选1。
-                    加分：月线低位、距120日高点回撤大(低吸)、站上关键均线+近5日创新高(强者恒强)、连板涨停(龙头多一条命)
-                    减分：20日涨幅大(兑现)、量能比>3(巨量出货)、高开>3%(高开兑现)、乖离>10%(兑现回调风险)
-                    低吸类策略(strategy_name in DIP_STRATEGIES)跳过强者恒强豁免与弱态扣分。"""
-                    try:
-                        import pandas as pd
-                        latest = df.iloc[0]
-                        close = latest['close']
-                        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
-
-                        # ===== 位置看月线（低位加分/高位减分）=====
-                        pos_score = 0.0
-                        try:
-                            d = df.iloc[::-1].reset_index(drop=True)
-                            monthly = d.resample('ME', on='date').agg({'high': 'max', 'low': 'min', 'close': 'last'}).dropna()
-                            if len(monthly) >= 6:
-                                m_high = monthly['high'].tail(12).max()
-                                m_low = monthly['low'].tail(12).min()
-                                if m_high > m_low:
-                                    month_pos = (close - m_low) / (m_high - m_low)
-                                    pos_score = 60 * (0.5 - month_pos) if month_pos < 0.5 else -50 * (month_pos - 0.5)
-                        except Exception:
-                            pos_score = 0.0
-
-                        # ===== 日线低吸机会（距120日高点回撤）=====
-                        high120 = df.head(120)['high'].max()
-                        drawdown = (high120 - close) / high120 if high120 > 0 else 0
-                        dd_score = drawdown * 30
-
-                        # ===== 20日涨幅（越大越接近兑现）=====
-                        base = df.head(20)['close'].iloc[-1] if len(df) >= 20 else prev_close
-                        rise20 = (close - base) / base if base > 0 else 0
-                        rise_penalty = -rise20 * 60
-
-                        # ===== 乖离率：距5日线/布林上轨>10% 兑现回调风险 =====
-                        ma5 = df.head(5)['close'].mean()
-                        ma20c = df.head(20)['close'].mean()
-                        std20 = df.head(20)['close'].std()
-                        boll_up = ma20c + 2 * std20
-                        gap_ma5 = (close - ma5) / ma5 if ma5 > 0 else 0
-                        gap_boll = (close - boll_up) / boll_up if boll_up and boll_up > 0 else 0
-                        deviate_penalty = 0.0
-                        if abs(gap_ma5) > 0.10:
-                            deviate_penalty += -40
-                        if gap_boll and gap_boll > 0.10:
-                            deviate_penalty += -40
-
-                        # ===== 强者恒强加分（站上关键均线+近5日创新高）=====
-                        ma10 = df.head(10)['close'].mean()
-                        ma20v = df.head(20)['close'].mean()
-                        strength = 0.0
-                        if close > ma5: strength += 5
-                        if close > ma10: strength += 5
-                        if close > ma20v: strength += 5
-                        high6 = df.head(6)['high'].max()
-                        if high6 > 0 and close >= high6:
-                            strength += 10  # 近5日创新高，强者恒强
-
-                        # ===== 龙头多一条命（近5日涨停/连板天数，提供风险容差）=====
-                        limit_days = 0
-                        try:
-                            d2 = df.iloc[::-1].reset_index(drop=True)
-                            for i in range(len(d2) - 1, max(len(d2) - 6, 0), -1):
-                                pc = d2['close'].iloc[i - 1]
-                                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
-                                    limit_days += 1
-                        except Exception:
-                            limit_days = 0
-                        strength += min(limit_days, 3) * 8  # 连板=龙头多一条命
-
-                        # ===== 龙头容差：强者/龙头适当抵消高位与乖离惩罚 =====
-                        tolerance = min(strength, 20) * 0.5
-
-                        # ===== 放巨量滞涨=出货；放量上涨=强势（不设高开惩罚：盘后选股高开已无意义）=====
-                        v5 = df.head(5)['volume'].mean()
-                        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
-                        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
-                        trap_penalty = 0.0
-                        if vol_ratio > 3 and chg < 0.01:
-                            trap_penalty = -60  # 放巨量但滞涨/收阴=主力出货
-                        elif vol_ratio > 1.5 and chg > 0.03:
-                            trap_penalty = 10  # 放量上攻=强者恒强
-
-                        # ===== 强者恒强豁免：持续创新高 + 量价健康（无加速/出货）→ 位置高低影响不大 =====
-                        # 用户平衡：个股足够强势（不断破新高）且没有加速和出货迹象，位置高不应重扣；
-                        # 但加速赶顶（5日涨幅过猛）或出货（巨量滞涨）仍照扣（兑现风险）。
-                        try:
-                            if strategy_name not in DIP_STRATEGIES:  # 低吸类不套用强者恒强豁免
-                                rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
-                                high20 = df.head(20)['high'].max()
-                                creating_new_high = high20 > 0 and close >= high20  # 收盘创近20日新高（持续破新高）
-                                healthy = (
-                                    vol_ratio < 5                      # 无明显极端放量
-                                    and not (vol_ratio > 3 and chg < 0.01)  # 非巨量滞涨（出货）
-                                    and rise5 < 0.25                    # 5日未涨超25%（无加速赶顶）
-                                )
-                                if creating_new_high and strength >= 15 and healthy:
-                                    if pos_score < 0:                    # 只弱化高位扣分，低位加分不动
-                                        pos_score = pos_score * 0.3
-                                    rise_penalty = rise_penalty * 0.5    # 20日涨幅兑现惩罚减半
-                                    deviate_penalty = deviate_penalty * 0.3  # 乖离容忍（强者不惧偏离）
-                        except Exception:
-                            pass
-
-                        # ===== 该强不强就是弱：本应走强却走弱 → 扣分（弱势股及时抽身）=====
-                        try:
-                            weak = 0.0
-                            if strategy_name not in DIP_STRATEGIES:  # 低吸类买的就是弱转强，不套用弱态扣分
-                                if vol_ratio > 1.5 and chg < 0:        # 放量却收阴/平盘=量给了没涨（该强不强）
-                                    weak -= 25
-                                if limit_days > 0 and chg < -0.01 and vol_ratio > 1.5:  # 放量断板走弱（缩量回调=健康回踩）
-                                    weak -= 15
-                                recent_close_max = df.head(3)['close'].max()
-                                if high20 > 0 and recent_close_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:  # 放量冲高未破回落至5日线下
-                                    weak -= 20
-                        except Exception:
-                            weak = 0.0
-
-                        # ===== 打分=小建议（排序用）：强者恒强加分 + 位置/涨幅/乖离风险修正 + 弱态/出货小扣 =====
-                        # 核心信号由策略规则 + 假信号过滤承担，打分仅决定"每策略多选时选哪 1 只"
-                        if strategy_name in DIP_STRATEGIES:
-                            # 低吸类：位置主导（买弱转强，低位低吸优先）
-                            score = pos_score + dd_score + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
-                        else:
-                            # 顺势/追强类：强度优先（强者恒强），位置仅轻量修正（×0.5）
-                            score = pos_score * 0.5 + dd_score * 0.5 + rise_penalty + deviate_penalty + strength + tolerance + trap_penalty + weak
-                        return round(score, 2)
-                    except Exception:
-                        return -9999
-
-                def _is_fake_signal(code, df, strategy_name):
-                    """规则层假信号规避（主力阴招）：策略命中后剔除假信号，核心信号规则之一。
-                    全局：放巨量滞涨(出货)、高开低走(高开兑现回落)
-                    追强类额外：加速赶顶(5日涨超25%)、乖离过大(>15%)、放量假突破(突破20日高回落MA5下)、放量断板大跌
-                    低吸类不排除假突破/加速/乖离（买入点即回调/低位）"""
-                    try:
-                        latest = df.iloc[0]
-                        close = latest['close']
-                        prev_close = df.iloc[1]['close'] if len(df) > 1 else close
-                        open_p = latest['open'] if 'open' in latest else close
-                        chg = (close - prev_close) / prev_close if prev_close > 0 else 0
-                        v5 = df.head(5)['volume'].mean()
-                        vol_ratio = latest['volume'] / v5 if v5 > 0 else 1
-                        ma5 = df.head(5)['close'].mean()
-                        is_dip = strategy_name in DIP_STRATEGIES
-                        # 全局：放巨量滞涨=出货
-                        if vol_ratio > 3 and chg < 0.01:
-                            return True, '放巨量滞涨(出货)'
-                        # 高开低走需分辨（量价二维 + 市场情绪动态阈值，避免极端行情误杀跟跌）：
-                        #  · 市场情绪动态阈值：极端普跌(涨家占比<0.3)→放宽8%(个股多为跟跌，非独立出货)；偏强(>0.6)→收紧4%(独立跌=真出货)；正常→5%
-                        #  · 量能主动分档（缩量=洗盘特征/放量=出货特征）：
-                        #      - 明显缩量(量比<1.0)=无量下杀，非主力派发→洗盘，仅极端下杀(跌幅>阈值+3%或>10%)算出货
-                        #      - 温和量(1.0~1.5)=按市场情绪动态阈值判断
-                        #      - 明显放量(量比>1.5)=主力借高开派发→跌破MA5 或 跌幅超阈值 即算出货
-                        #  · 其余（缩量温和回落 / 守住MA5 / 跌幅小）= 洗盘（无量回踩浮筹，之后仍可能拉升）→ 保留
-                        if prev_close > 0 and (open_p / prev_close - 1) > 0.03 and close < prev_close:
-                            day_drop = (prev_close - close) / prev_close
-                            try:
-                                _td = str(df['date'].iloc[0]).replace('-', '')
-                                _up_ratio = _get_market_sentiment(_td).get('up_ratio', 0.5)
-                            except Exception:
-                                _up_ratio = 0.5
-                            if _up_ratio < 0.3:
-                                drop_thresh = 0.08
-                            elif _up_ratio > 0.6:
-                                drop_thresh = 0.04
-                            else:
-                                drop_thresh = 0.05
-                            if vol_ratio < 1.0:
-                                # 明显缩量=洗盘特征，仅极端下杀(超市场阈值+3%或>10%)才算出货
-                                if day_drop > max(drop_thresh + 0.03, 0.10):
-                                    return True, '高开低走(缩量极端下杀)'
-                            elif vol_ratio > 1.5:
-                                # 明显放量=出货特征，跌破MA5 或 跌幅超阈值 即剔
-                                if close < ma5 or day_drop > drop_thresh:
-                                    return True, '高开低走(放量出货)'
-                            else:
-                                # 温和量(1.0~1.5)：按市场情绪动态阈值
-                                if day_drop > drop_thresh:
-                                    return True, '高开低走(出货)'
-                        if is_dip:
-                            return False, ''
-                        # 追强类：加速赶顶（多维，不只5日涨幅）——龙头策略豁免（连板加速是龙头常态）
-                        #  主信号：5日涨幅>25% 或 10日涨幅>40%（补10日维度，防单日跳空虚高漏判/误判）
-                        #  确认（任一）：放量(量比>1.5)、乖离MA20>15%、高位(距120日高点回撤<10%)
-                        #  排除：缩量+低乖离+非高位的健康上行（强者恒强，不误杀）
-                        rise5 = (close / df.head(5)['close'].iloc[-1] - 1) if len(df) >= 6 else 0
-                        rise10 = (close / df.head(10)['close'].iloc[-1] - 1) if len(df) >= 11 else 0
-                        if strategy_name != 'LeaderStrategy' and (rise5 >= 0.25 or rise10 >= 0.40):
-                            _ma20v = df.head(20)['close'].mean()
-                            _bias20 = (close - _ma20v) / _ma20v if _ma20v > 0 else 0
-                            _high120 = df.head(120)['high'].max()
-                            _near_high = _high120 > 0 and (_high120 - close) / _high120 < 0.10
-                            if vol_ratio > 1.5 or _bias20 > 0.15 or _near_high:
-                                return True, '加速赶顶(短期涨幅过大+放量/乖离/高位)'
-                        # 追强类：乖离过大（距MA5>15%，随时兑现）——龙头策略豁免
-                        if strategy_name != 'LeaderStrategy' and ma5 > 0 and (close - ma5) / ma5 > 0.15:
-                            return True, '乖离过大(>15%)'
-                        # 追强类：放量假突破（近3日曾触20日新高，今日放量跌破MA5=突破失败）
-                        high20 = df.head(20)['high'].max()
-                        recent_max = df.head(3)['close'].max()
-                        if high20 > 0 and recent_max >= high20 * 0.99 and close < ma5 and vol_ratio > 1.5:
-                            return True, '放量假突破'
-                        # 追强类：放量断板大跌（近2日有涨停，今日放量跌>5%=断板出货）
-                        try:
-                            d2 = df.iloc[::-1].reset_index(drop=True)
-                            has_limit = False
-                            for i in range(len(d2) - 1, max(len(d2) - 3, 0), -1):
-                                pc = d2['close'].iloc[i - 1]
-                                if pc > 0 and (d2['close'].iloc[i] - pc) / pc >= 0.095:
-                                    has_limit = True
-                                    break
-                            if has_limit and chg < -0.05 and vol_ratio > 1.5:
-                                return True, '放量断板大跌'
-                        except Exception:
-                            pass
-                        return False, ''
-                    except Exception:
-                        return False, ''
-
-                def _run_strategy(item):
-                    sname, sobj = item
-                    s_display = strategy_display_names.get(sname, sname)
-                    sigs = []
-                    errs = 0
-                    t0 = dt.now()
-                    for code, (name, df) in stock_data.items():
-                        try:
-                            r = sobj.analyze_stock(code, name, df)
-                            if r:
-                                fake, fake_reason = _is_fake_signal(code, df, sname)
-                                if fake:
-                                    func_logger.info(f"策略 {sname} 剔除假信号 {code} {name}: {fake_reason}")
-                                    continue
-                                sigs.append({
-                                    'code': r['code'],
-                                    'name': r.get('name', stock_names.get(code, '未知')),
-                                    'signals': r['signals'],
-                                    'strategy_display_name': s_display
-                                })
-                        except Exception:
-                            errs += 1
-                    # 每策略最多1只：按股价位置/主力行为打分选最优（逆人性低吸优先）
-                    if len(sigs) > 1:
-                        scored = []
-                        for _s in sigs:
-                            _df = stock_data.get(_s['code'], (None, None))[1]
-                            _sc = _position_score(_s['code'], _df, sname) if _df is not None else -9999
-                            scored.append((_sc, _s))
-                        scored.sort(key=lambda x: -x[0])
-                        sigs = [scored[0][1]]
-                        func_logger.info(f"策略 {sname} 命中 {len(scored)} 只，位置打分选1: {sigs[0]['code']} {sigs[0]['name']} (score={scored[0][0]})")
-
-                    func_logger.info(f"策略 {sname} 完成 - 选中 {len(sigs)} 只，耗时 {(dt.now()-t0).total_seconds():.1f}秒")
-                    return sname, sigs, errs
+                # 供子进程(fork继承)读取的策略执行上下文；子进程只读、只算，返回结果，不写库
+                global _MP_STOCK_DATA, _MP_STOCK_NAMES, _MP_DISPLAY, _MP_REGISTRY
+                _MP_STOCK_DATA = stock_data
+                _MP_STOCK_NAMES = stock_names
+                _MP_DISPLAY = strategy_display_names
+                _MP_REGISTRY = registry
 
                 func_logger.info(f"并行执行 {len(strategies_to_execute)} 个策略 (workers={_max_workers})")
-                with ThreadPoolExecutor(max_workers=_max_workers) as pool:
-                    futures = {pool.submit(_run_strategy, item): item for item in strategies_to_execute}
+                with ProcessPoolExecutor(max_workers=_max_workers, mp_context=_mp.get_context('fork')) as pool:
+                    futures = {pool.submit(_run_strategy, sname): sname for sname, _ in strategies_to_execute}
                     for future in as_completed(futures):
                         sname, sigs, errs = future.result()
                         results[sname] = sigs
@@ -1374,7 +1404,15 @@ def run_selection():
         
         # 返回结果
         total_time = (dt.now() - request_start_time).total_seconds()
-        func_logger.info(f"选股完成 - 返回结果数: {len(results)}，总耗时 {total_time:.1f}秒")
+        # 统计实际命中（排除 _intersection_analysis/_hold_decision 等特殊字段），避免"字典key数"误导为股票数
+        _hit_names = [k for k in results if not str(k).startswith('_') and results[k]]
+        _selected_codes = set()
+        for _k in _hit_names:
+            for _sig in results[_k]:
+                _c = _sig.get('code') if isinstance(_sig, dict) else _sig
+                if _c:
+                    _selected_codes.add(str(_c))
+        func_logger.info(f"选股完成 - 命中 {len(_hit_names)} 策略 / 去重 {len(_selected_codes)} 股，总耗时 {total_time:.1f}秒")
         func_logger.info("=" * 60)
         
         # 应用过滤条件
@@ -1402,7 +1440,25 @@ def run_selection():
             
             # 使用过滤后的结果
             results = filtered_results
-            
+
+            # 方案C：对候选股补拉 400 天官方历史（历史100%官方，供最终判定/推荐价格）
+            try:
+                from utils import technical as _tech
+                _cands = []
+                for _sigs in results.values():
+                    if not isinstance(_sigs, list):
+                        continue
+                    for _s in _sigs:
+                        _c = _s.get('code') if isinstance(_s, dict) else _s
+                        if _c:
+                            _cands.append(_c)
+                _cands = list(dict.fromkeys(_cands))
+                if _cands:
+                    _n = _tech.prefetch_official_factor_history(codes=_cands)
+                    func_logger.info(f"候选股补拉400天官方历史完成，命中 {_n}/{len(_cands)} 只")
+            except Exception as _e:
+                func_logger.warning(f"候选股补拉官方历史失败: {_e}")
+
             # 重新计算交集分析（基于过滤后的结果）
             if len(results) > 1:
                 # 检查是否有任何策略有结果
@@ -1459,6 +1515,121 @@ def run_selection():
         except Exception as e:
             func_logger.warning(f"获取实时价格失败，使用CSV收盘价: {str(e)}")
         
+        # ==================== 选股逻辑重构：策略持有决策 ====================
+        # 每个策略维护一个最强持有标的：命中后进入观察期，通过强弱对比给出「继续持有/切换/舍弃」建议
+        try:
+            from utils.strategy_hold_manager import StrategyHoldManager
+            from trading.stock_score_api import calculate_stock_score
+            hold_mgr = StrategyHoldManager(db_manager)
+            hold_decisions = {}
+
+            # ---- 股票级卖出联动预判 ----
+            # 被任一策略持有、且本轮又被选为候选的股票，若历史回扫触发卖出，
+            # 则本轮任何策略不得再选它（避免"策略A因卖出踢掉该股、策略B却同轮新买"的矛盾）
+            sold_stocks = {}
+            try:
+                _cand_codes = set()
+                for _sk in list(results.keys()):
+                    if _sk.startswith('_'):
+                        continue
+                    for _s in (results.get(_sk) or []):
+                        if isinstance(_s, dict) and _s.get('code'):
+                            _cand_codes.add(_s['code'])
+                from utils.sell_signal import compute_sell_signal
+                for _sk in list(results.keys()):
+                    if _sk.startswith('_'):
+                        continue
+                    _h = hold_mgr._get_hold(_sk)
+                    if not _h or not _h.get('stock_code'):
+                        continue
+                    _c = _h['stock_code']
+                    if _c not in _cand_codes or _c in sold_stocks:
+                        continue
+                    _px, _dt = _h.get('hold_price'), _h.get('hit_date')
+                    if not _px or not _dt:
+                        continue
+                    _sell = compute_sell_signal(db_manager, _c, float(_px), str(_dt))
+                    if _sell and _sell.get('sell_status') == '卖出':
+                        sold_stocks[_c] = _sell.get('sell_reason') or '触发卖出'
+                if sold_stocks:
+                    func_logger.info(f"股票级卖出联动: {len(sold_stocks)} 只股票触发卖出，本轮不得再作为新候选: {sold_stocks}")
+            except Exception as _e:
+                func_logger.warning(f"股票级卖出联动预判失败(忽略): {_e}")
+
+            for strategy_key in list(results.keys()):
+                if strategy_key.startswith('_'):
+                    continue
+                signals = results.get(strategy_key)
+                if not isinstance(signals, list):
+                    continue
+                candidates = [s for s in signals if isinstance(s, dict) and s.get('code')]
+                if not candidates:
+                    hold_decisions[strategy_key] = hold_mgr.decide(strategy_key, None, end_date)
+                    results[strategy_key] = []
+                    continue
+                # 取综合评分最高候选作为当天最优（已触发卖出的候选剔除，避免买回走弱股）
+                best, best_score = None, -1.0
+                for s in candidates:
+                    if s.get('code') in sold_stocks:
+                        continue
+                    try:
+                        sc = calculate_stock_score(s['code'], end_date)
+                    except Exception:
+                        sc = 0.0
+                    if sc > best_score:
+                        best_score, best = sc, s
+                if best is not None:
+                    best['score'] = best_score
+                    # 命中价：优先取候选自带 price；否则取选股日(end_date)真实收盘价，
+                    # 避免误用已被实时价格替换的 signals close 作为命中价（会导致卖出收益基准错误）
+                    if not best.get('price'):
+                        _px = None
+                        try:
+                            _kdf = db_manager.read_stock(best['code'])
+                            if _kdf is not None and not _kdf.empty:
+                                import pandas as _pd
+                                _dcol = _kdf['date'] if 'date' in _kdf.columns else _kdf.index
+                                _hit = _kdf[_pd.to_datetime(_dcol) == _pd.to_datetime(end_date)]
+                                if not _hit.empty:
+                                    _px = float(_hit.iloc[0]['close'])
+                        except Exception:
+                            _px = None
+                        if not _px:
+                            for sig in (best.get('signals') or []):
+                                if isinstance(sig, dict) and sig.get('close'):
+                                    _px = sig['close']
+                                    break
+                        best['price'] = _px
+                    # 提取选入信号理由（策略命中原因：均线金叉/MACD金叉/KDJ金叉等）
+                    _sel_reasons = best.get('reasons') or []
+                    if not _sel_reasons and best.get('signals'):
+                        _s0 = best['signals'][0] if isinstance(best['signals'], list) and best['signals'] else {}
+                        _sel_reasons = _s0.get('reasons') or []
+                    best['select_reason'] = ('；'.join(str(x) for x in _sel_reasons)) if _sel_reasons else ''
+                decision = hold_mgr.decide(strategy_key, best, end_date,
+                                           score_fn=lambda c, d: calculate_stock_score(c, d))
+                hold_decisions[strategy_key] = decision
+                rec = decision.get('recommend')
+                if rec:
+                    keep_signals = best.get('signals', []) if best else []
+                    display = candidates[0].get('strategy_display_name', '') if candidates else ''
+                    results[strategy_key] = [{
+                        'code': rec['code'],
+                        'name': rec['name'],
+                        'signals': keep_signals,
+                        'strategy_display_name': display,
+                        'score': rec['score'],
+                        'horizon': decision.get('horizon', ''),
+                        'hold_action': decision.get('action', ''),
+                        'hold_reason': decision.get('reason', ''),
+                    }]
+                else:
+                    results[strategy_key] = []
+            results['_hold_decision'] = hold_decisions
+            func_logger.info(f"策略持有决策完成: {len(hold_decisions)} 个策略，持有建议 {sum(1 for d in hold_decisions.values() if d.get('recommend'))} 个")
+        except Exception as e:
+            func_logger.error(f"策略持有决策失败，保留原结果: {e}")
+
         # 不再自动保存选股结果，由前端手动触发保存
         # 清理数据中的NaN和Inf值
         cleaned_results = clean_data_for_json(results)
@@ -1570,13 +1741,12 @@ def run_selection():
             _feishu_cfg = _cfg.get('feishu', {})
             _webhook_url = os.environ.get('FEISHU_WEBHOOK') or _feishu_cfg.get('webhook_url', '')
             _notifier = FeishuNotifier(_webhook_url)
-            _lines = [f"📊 缅A每日推送 ({dt.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
             _total = 0
             _all_stocks = []
-            _stock_strategies = {}   # code -> [策略名]（用于多策略共振置顶）
+            _stock_strategies = {}   # code -> [策略名]
             _stock_prices = {}       # code -> 价格
 
-            # ── 第一遍：收集所有股票 + 各自命中的策略（去重）──
+            # ── 收集所有股票 + 各自命中的策略（去重）──
             for _sname, _signals in cleaned_results.items():
                 if isinstance(_signals, list) and _signals:
                     for _s in _signals:
@@ -1590,229 +1760,31 @@ def run_selection():
                                 _all_stocks.append({'code': _code, 'name': _name})
                             _stock_strategies[_code].append(_sname)
             _total = len(_all_stocks)
-            _multi = {c: s for c, s in _stock_strategies.items() if len(s) >= 2}
 
-            # ── 标题 + 总数 ──
-            _lines[1] = f"共 {_total} 只入选 ｜ {len(_multi)} 只多策略共振"
+            # ── 使用统一推送模板构建唯一消息（模板二：持仓操作）──
+            from utils.push_templates import build_message
+            from simple_analyzer import analyze_stock, generate_advice_for_hold
+            _strength = lambda _c: _strength_label(db_manager, _c)
+            _msg = build_message(
+                _all_stocks, _stock_strategies, _stock_prices,
+                _strength, analyze_stock, generate_advice_for_hold)
 
-            # ── ⭐ 多策略共振置顶推荐 ──
-            if _multi:
-                _lines.append("━━━━━━━━━━━━━━━━━━━━")
-                _lines.append("⭐ 重点推荐 · 多策略共振（置顶）")
-                _lines.append("")
-                for _code, _strats in sorted(_multi.items(), key=lambda x: -len(x[1])):
-                    _nm = next((s['name'] for s in _all_stocks if s['code'] == _code), '')
-                    _lines.append(f"🟢 {_code} {_nm} {_stock_prices[_code]}")
-                    _lines.append(f"   ✦ {len(_strats)} 策略共振：{' · '.join(_strats)}")
-                    _lines.append("")
-
-            # ── 📋 各策略入选（精简合并一行）──
-            _lines.append("━━━━━━━━━━━━━━━━━━━━")
-            _lines.append(f"📋 各策略入选（{_total} 只）")
-            _lines.append("")
-            for _sname, _signals in cleaned_results.items():
-                if isinstance(_signals, list) and _signals:
-                    _tokens = []
-                    for _s in _signals:
-                        _code = _s.get('code', '')
-                        _name = _s.get('name', '')
-                        _sig = _s.get('signals', [])
-                        _px = _sig[0].get('close', '') if _sig else ''
-                        _tokens.append(f"{_code} {_name}" + (f" {_px}" if _px and _px != '-' else ''))
-                    _lines.append(f"【{_sname}】{' ・ '.join(_tokens)}")
-            _lines.append("")
-
-            # 与上一日对比：新增/去除（去除精简为一行）
+            # ============ 推送发送（飞书 + 钉钉，各一条）============
+            _feishu_enabled = _cfg.get('feishu', {}).get('enabled', True)
             if _total > 0:
-                try:
-                    from utils.selection_record_manager import SelectionRecordManager
-                    _srm = SelectionRecordManager()
-                    _today_codes = {s['code'] for s in _all_stocks}
-                    _today_date = dt.now().strftime('%Y-%m-%d')
-
-                    _prev_result = _srm.get_selection_history(
-                        filters={'end_date': _today_date}, page=1, limit=5000
-                    )
-                    _prev_stocks = {}
-                    for _r in (_prev_result.get('data') or []):
-                        _d = _r.get('selection_date', '')
-                        if _d and _d < _today_date:
-                            if _d not in _prev_stocks:
-                                _prev_stocks[_d] = set()
-                            _prev_stocks[_d].add(_r.get('stock_code', ''))
-
-                    if _prev_stocks:
-                        _prev_date = max(_prev_stocks.keys())
-                        _prev_codes = _prev_stocks[_prev_date]
-                        _new_codes = _today_codes - _prev_codes
-                        _removed_codes = _prev_codes - _today_codes
-
-                        if _new_codes or _removed_codes:
-                            _lines.append("━━━━━━━━━━━━━━━━━━━━")
-                            _lines.append(f"📋 与 {_prev_date} 对比")
-                            if _new_codes:
-                                _new_names = [f"{s['code']} {s['name']}" for s in _all_stocks if s['code'] in _new_codes]
-                                _lines.append(f"🟢 新增 ({len(_new_codes)}只): {' ・ '.join(_new_names)}")
-                            if _removed_codes:
-                                _rlist = sorted(_removed_codes)
-                                _show = ' ・ '.join(_rlist[:10])
-                                _tail = f" …等{len(_rlist)}只" if len(_rlist) > 10 else ''
-                                _lines.append(f"🔴 去除 ({len(_rlist)}只): {_show}{_tail}")
-                            _lines.append("")
-                except Exception as _diff_err:
-                    func_logger.warning(f"对比历史选股失败: {_diff_err}")
-
-            # ─── 买入建议分析 ───
-            if _all_stocks:
-                try:
-                    from simple_analyzer import analyze_stock, format_analysis_message
-                    _analyses = []
-                    _seen_codes = set()
-                    for _stock in _all_stocks:
-                        if _stock['code'] in _seen_codes:
-                            continue
-                        _seen_codes.add(_stock['code'])
-                        _a = analyze_stock(_stock['code'], _stock['name'])
-                        if _a['score'] > 0:
-                            _analyses.append(_a)
-                    if _analyses:
-                        _analysis_msg = format_analysis_message(_analyses)
-                        if _analysis_msg:
-                            _lines.append(_analysis_msg)
-                except Exception as _a_err:
-                    func_logger.warning(f"买入建议分析失败: {_a_err}")
-
-            # ─── 前3天推荐股票操作建议（持有/卖出位置）───
-            try:
-                from utils.selection_record_manager import SelectionRecordManager
-                from simple_analyzer import generate_advice_for_hold
-                _srm_adv = SelectionRecordManager()
-                _today_adv = dt.now().strftime('%Y-%m-%d')
-                _hist_adv = _srm_adv.get_selection_history({'end_date': _today_adv}, page=1, limit=5000)
-                _rec_by_date = {}
-                for _r in (_hist_adv.get('data') or []):
-                    _d = _r.get('selection_date', '')
-                    if _d and _d < _today_adv:
-                        _rec_by_date.setdefault(_d, []).append(_r)
-                _last3 = sorted(_rec_by_date.keys())[-3:]
-                if _last3:
-                    _adv_stocks = {}
-                    for _d in _last3:
-                        for _r in _rec_by_date[_d]:
-                            _c = _r.get('stock_code', '')
-                            if _c and _c not in _adv_stocks:
-                                _adv_stocks[_c] = {'name': _r.get('stock_name', '')}
-                    _lvl_icon = {'持有': '🟢 持有', '减仓': '🟡 减仓', '卖出': '🔴 卖出'}
-                    _advice_lines = ["━━━━━━━━━━━━━━━━━━━━",
-                                     f"📅 前{len(_last3)}个选股日推荐 · 操作建议",
-                                     ""]
-                    for _code, _info in _adv_stocks.items():
-                        _a = generate_advice_for_hold(_code, _info['name'])
-                        if _a:
-                            _sig = '；'.join(_a['signals']) if _a['signals'] else '正常'
-                            _tip = _lvl_icon.get(_a['level'], _a['level'])
-                            _stop_s = f"｜止损 {_a['stop']:.2f}" if _a['stop'] else ''
-                            _tgt_s = f"｜止盈参考 {_a['target']:.2f}" if _a['target'] else ''
-                            _advice_lines.append(
-                                f"{_tip} {_code} {_a['name']} | 现价 {_a['current']:.2f} ({_a['pct']:+.1f}%) | {_sig}{_stop_s}{_tgt_s}"
-                            )
-                    if len(_advice_lines) > 3:
-                        _advice_lines.append("")
-                        _lines.append("\n".join(_advice_lines))
-            except Exception as _adv_err:
-                func_logger.warning(f"生成前3天操作建议失败: {_adv_err}")
-
-            # ─── 每日大盘复盘 + 新闻 ───
-            try:
-                import requests as _req
-
-                # 1) 主要指数行情
-                _index_codes = [
-                    ('sh000001', '上证指数'),
-                    ('sz399001', '深证成指'),
-                    ('sz399006', '创业板指'),
-                    ('sh000688', '科创50'),
-                ]
-                _idx_lines = []
-                for _code, _name in _index_codes:
-                    try:
-                        _url = f"https://qt.gtimg.cn/q={_code}"
-                        _resp = _req.get(_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-                        _data = _resp.text.split('~')
-                        if len(_data) > 45:
-                            _price = _data[3]
-                            _pct = _data[32]
-                            _vol = _data[37]  # 成交额(万)
-                            try:
-                                _vol_yi = float(_vol) / 10000
-                                _vol_str = f"{_vol_yi:.0f}亿"
-                            except Exception:
-                                _vol_str = ''
-                            _emoji = '🔴' if float(_pct) > 0 else '🟢' if float(_pct) < 0 else '⚪'
-                            _idx_lines.append(f"  {_emoji} {_name}: {_price} ({_pct}%) {_vol_str}")
-                    except Exception:
-                        pass
-                if _idx_lines:
-                    _lines.append("━━━━━━━━━━━━━━━━━━━━")
-                    _lines.append(f"📈 今日大盘复盘 ({dt.now().strftime('%Y-%m-%d %H:%M:%S')})")
-                    _lines.append("")
-                    _lines.extend(_idx_lines)
-                    _lines.append("")
-
-                # 2) 板块涨跌热力图
-                try:
-                    _sec_resp = _req.get(
-                        'https://vip.stock.finance.sina.com.cn/q/view/newSinaHy.php',
-                        timeout=8, headers={'User-Agent': 'Mozilla/5.0'}
-                    )
-                    import re as _re, json as _json
-                    from sector_data import format_sector_message as _sector_msg
-                    _sector_text = _sector_msg()
-                    if _sector_text:
-                        _lines.append("━━━━━━━━━━━━━━━━━━━━")
-                        _lines.append(_sector_text)
-                except Exception:
-                    pass
-
-                # 3) 财经要闻（新浪财经）
-                try:
-                    _news_resp = _req.get(
-                        'https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=12&page=1',
-                        timeout=8,
-                        headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn'}
-                    )
-                    _news_list = _news_resp.json().get('result', {}).get('data', [])
-                    if _news_list:
-                        _lines.append("━━━━━━━━━━━━━━━━━━━━")
-                        _lines.append("📰 今日财经要闻")
-                        _lines.append("")
-                        for _n in _news_list[:8]:
-                            _title = _n.get('title', '')[:50]
-                            _intro = _n.get('intro', '')
-                            if _title:
-                                _lines.append(f"  • {_title}")
-                                if _intro:
-                                    _lines.append(f"    {_intro}")
-                        _lines.append("")
-                except Exception:
-                    pass
-
-            except Exception as _idx_err:
-                func_logger.warning(f"获取大盘数据失败: {_idx_err}")
-
-            if _total > 0:
-                _msg_text = "\n".join(_lines)
-                # 飞书推送（enabled=false 时跳过）
-                _feishu_enabled = _cfg.get('feishu', {}).get('enabled', True)
+                # 飞书
                 if not _feishu_enabled:
                     func_logger.info("飞书推送已关闭（enabled=false），跳过")
                 else:
-                    _ok = _notifier.send_text(_msg_text)
-                    if _ok:
-                        func_logger.info(f"飞书推送完成，共 {_total} 只股票入选")
-                    else:
-                        func_logger.warning(f"飞书推送未完成（webhook 无效或推送失败）")
-                # 钉钉推送（与飞书并列；未配置或 enabled=false 时跳过）
+                    try:
+                        _ok = _notifier.send_text(_msg)
+                        if _ok:
+                            func_logger.info("飞书推送完成")
+                        else:
+                            func_logger.warning("飞书推送未完成（webhook 无效或推送失败）")
+                    except Exception as _fs_err:
+                        func_logger.warning(f"飞书推送失败: {_fs_err}")
+                # 钉钉
                 try:
                     from utils.dingtalk_notifier import DingTalkNotifier
                     _ding_cfg = _cfg.get('dingtalk', {})
@@ -1823,14 +1795,14 @@ def run_selection():
                             _ding_cfg.get('webhook_url', ''),
                             _ding_cfg.get('secret', ''),
                         )
-                        if _ding.send_text(_msg_text):
+                        if _ding.send_text(_msg):
                             func_logger.info("钉钉推送完成")
                         else:
                             func_logger.warning("钉钉推送未完成（webhook 未配置或失败）")
                 except Exception as _ding_err:
                     func_logger.warning(f"钉钉推送失败: {_ding_err}")
             else:
-                func_logger.info("选股结果为空，跳过飞书推送")
+                func_logger.info("选股结果为空，跳过推送")
         except Exception as _fe:
             func_logger.warning(f"飞书推送失败: {_fe}")
 
@@ -2352,6 +2324,93 @@ def update_config():
         return jsonify({'success': False, 'error': str(e)})
 
 
+@app.route('/api/selection/config', methods=['GET'])
+def get_selection_config():
+    """获取选股参数配置（策略持有决策：观察期 + 舍弃阈值）"""
+    try:
+        config_file = Path("config/strategy_params.yaml")
+        import yaml
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+        hold = cfg.get('strategy_hold', {}) or {}
+        opd = hold.get('observe_period_days') or {}
+        # 缺失字段回退内置默认（与 strategy_hold_manager 模块默认一致），保证界面始终显示有效值
+        # 负面技术指标参数（缺失回退内置默认，保证界面始终显示有效值）
+        neg = cfg.get('negative_signals') or {}
+        neg_defaults = {
+            'break_score': -20, 'off5_pct': 10, 'off5_score': -20,
+            'overboll_pct': 10, 'overboll_score': -15,
+            'stagnation_pct': 2, 'stagnation_score': -20,
+            'bigdrop_pct': 3, 'bigdrop_score': -30, 'vol_mult': 1.5,
+        }
+        negative = {k: (float(neg[k]) if k not in ('break_score', 'off5_score', 'overboll_score', 'stagnation_score', 'bigdrop_score') else int(neg[k]))
+                    if k in neg else neg_defaults[k] for k in neg_defaults}
+        return jsonify({'success': True, 'data': {
+            'observe_period_days': {
+                'short': int(opd.get('short', 3)),
+                'mid': int(opd.get('mid', 5)),
+                'long': int(opd.get('long', 10)),
+            },
+            'abandon_score_threshold': float(hold.get('abandon_score_threshold', 60)),
+            'negative_signals': negative,
+        }})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/selection/config', methods=['POST'])
+def update_selection_config():
+    """更新选股参数配置（观察期 short/mid/long、舍弃阈值），写回 strategy_params.yaml，立即生效"""
+    try:
+        import yaml
+        data = request.json or {}
+        config_file = Path("config/strategy_params.yaml")
+        with open(config_file, 'r', encoding='utf-8') as f:
+            cfg = yaml.safe_load(f) or {}
+        if 'strategy_hold' not in cfg:
+            cfg['strategy_hold'] = {}
+        hold = cfg['strategy_hold']
+        # 观察期（短线/中线/长线）
+        opd = dict(hold.get('observe_period_days') or {})
+        for k in ('short', 'mid', 'long'):
+            v = data.get(k)
+            if isinstance(v, (int, float)) and v > 0:
+                opd[k] = int(v)
+        if opd:
+            hold['observe_period_days'] = opd
+        # 舍弃阈值
+        thr = data.get('abandon_score_threshold')
+        if isinstance(thr, (int, float)) and thr > 0:
+            hold['abandon_score_threshold'] = float(thr)
+        # 负面技术指标参数
+        neg_fields = ['break_score', 'off5_pct', 'off5_score', 'overboll_pct', 'overboll_score',
+                      'stagnation_pct', 'stagnation_score', 'bigdrop_pct', 'bigdrop_score', 'vol_mult']
+        neg = dict(cfg.get('negative_signals') or {})
+        for k in neg_fields:
+            v = data.get(k)
+            if isinstance(v, (int, float)) and v:
+                neg[k] = int(v) if k.endswith('_score') else float(v)
+        if neg:
+            cfg['negative_signals'] = neg
+        with open(config_file, 'w', encoding='utf-8') as f:
+            yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+        func_logger = logging.getLogger(__name__)
+        # 写回后刷新负面指标配置（即时生效，无需重启）
+        try:
+            from utils.sell_signal import reload_negative_config
+            reload_negative_config()
+        except Exception as e:
+            func_logger.warning(f"刷新负面指标配置失败: {e}")
+        func_logger.info(f"选股参数配置已更新: {data}")
+        return jsonify({'success': True, 'message': '选股参数配置更新成功', 'data': hold})
+    except Exception as e:
+        import traceback
+        func_logger = logging.getLogger(__name__)
+        func_logger.error(f"更新选股参数配置失败: {str(e)}")
+        func_logger.error(f"错误堆栈: {traceback.format_exc()}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
 def emit_update_progress():
     """通过WebSocket发送更新进度"""
     socketio.emit('update_progress', {
@@ -2451,381 +2510,553 @@ def get_update_status():
     })
 
 
+def _mutual_strength(weak_dict, strong_dict):
+    """走强/走弱互斥判定：返回 weak | strong | none（二者不同时非 none 输出，只记录一个状态）
 
+    规则：按等级权重比较（弱 none=0 warning=1 confirmed=2 trend_weak=3；
+    强 none=0 appear=1 confirmed=2 trend_up=3），等级高者胜；
+    等级相同再按趋势方向（趋势转空→weak，趋势转多→strong）；否则 none。
+    """
+    wl = (weak_dict or {}).get('level', 'none')
+    sl = (strong_dict or {}).get('level', 'none')
+    wk = {'none': 0, 'warning': 1, 'confirmed': 2, 'trend_weak': 3}
+    sk = {'none': 0, 'appear': 1, 'confirmed': 2, 'trend_up': 3}
+    wR = wk.get(wl, 0)
+    sR = sk.get(sl, 0)
+    tbear = bool((weak_dict or {}).get('trend_bear'))
+    tup = bool((strong_dict or {}).get('trend_up'))
+    if wR > sR:
+        return 'weak:' + (wl if wl != 'none' else 'warning')
+    if sR > wR:
+        return 'strong:' + (sl if sl != 'none' else 'appear')
+    if tbear and not tup:
+        return 'weak:warning'
+    if tup and not tbear:
+        return 'strong:appear'
+    return 'none'
+
+
+def _strength_label(db, code):
+    """计算单只股票的强弱真伪标识（真走强/假走强/真走弱/假走弱/无），弱强互斥"""
+    try:
+        from utils.weak_signal import compute_weak_signal
+        from utils.strong_signal import compute_strong_signal
+        w = compute_weak_signal(db, code)
+        s = compute_strong_signal(db, code)
+        lv = _mutual_strength(w, s)
+        if lv.startswith('weak:'):
+            return '假走弱' if (w or {}).get('falsify') else '真走弱'
+        if lv.startswith('strong:'):
+            return '真走强' if (s or {}).get('confirm') else '假走强'
+        return ''
+    except Exception:
+        return ''
 
 
 @app.route('/api/selection-history', methods=['GET'])
 def get_selection_history():
-    """
-    查询选股历史
-    
-    参数：
-        strategy_name: 策略名称（可选）
-        start_date: 开始日期 YYYY-MM-DD（可选）
-        end_date: 结束日期 YYYY-MM-DD（可选）
-        stock_code: 股票代码（可选）
-        page: 分页页码，默认1
-        limit: 每页数量，默认20
-    
-    返回：
-        {
-            'success': True,
-            'total': 100,
-            'page': 1,
-            'limit': 20,
-            'data': [...]
-        }
+    """查询选股记录（选股记录表 daily 明细：每天选股了哪些股票、命中策略、价格等）
+
+    数据源：stock_selection_record（选股记录表），非选股池。
+    参数：strategy_name / stock_code / start_date / end_date / page / limit
+    返回：{success, total, page, limit, data}
     """
     try:
-        # 获取查询参数
-        strategy_name = request.args.get('strategy_name', '')
-        start_date = request.args.get('start_date', '')
-        end_date = request.args.get('end_date', '')
-        stock_code = request.args.get('stock_code', '')
-        page = int(request.args.get('page', 1))
-        limit = int(request.args.get('limit', 20))
-        
-        # 构建筛选条件
-        filters = {}
+        strategy_name = (request.args.get('strategy_name') or '').strip()
+        stock_code = (request.args.get('stock_code') or '').strip()
+        start_date = (request.args.get('start_date') or '').strip()
+        end_date = (request.args.get('end_date') or '').strip()
+        try:
+            page = max(1, int(request.args.get('page', 1)))
+        except (ValueError, TypeError):
+            page = 1
+        try:
+            limit = max(1, min(200, int(request.args.get('limit', 20))))
+        except (ValueError, TypeError):
+            limit = 20
+        from utils.global_db import get_global_db
+        dbm = get_global_db()
+        where = []
+        params = []
         if strategy_name:
-            filters['strategy_name'] = strategy_name
-        if start_date:
-            filters['start_date'] = start_date
-        if end_date:
-            filters['end_date'] = end_date
+            from utils.selection_record_manager import strategy_filter_candidates
+            cands = strategy_filter_candidates(strategy_name)
+            where.append("(" + " OR ".join(["strategy_name LIKE ?"] * len(cands)) + ")")
+            for c in cands:
+                params.append('%' + c + '%')
         if stock_code:
-            filters['stock_code'] = stock_code
-        
-        # 查询选股历史
-        result = selection_record_manager.get_selection_history(
-            filters=filters,
-            page=page,
-            limit=limit
-        )
-        
-        # 转换 numpy 类型为 Python 原生类型
-        if result.get('success') and result.get('data'):
-            for record in result['data']:
-                for key, value in record.items():
-                    # 将 numpy 类型转换为 Python 原生类型
-                    if hasattr(value, 'item'):
-                        record[key] = value.item()
-        
-        return jsonify(result)
-    
+            where.append("stock_code = ?")
+            params.append(stock_code)
+        if start_date:
+            where.append("selection_date >= ?")
+            params.append(start_date)
+        if end_date:
+            where.append("selection_date <= ?")
+            params.append(end_date)
+        wsql = ' AND '.join(where) if where else '1=1'
+        total = dbm.query(f"SELECT COUNT(*) AS c FROM stock_selection_record WHERE {wsql}", params)[0]['c']
+        rows = dbm.query(
+            f"SELECT * FROM stock_selection_record WHERE {wsql} ORDER BY selection_date DESC, id DESC LIMIT ? OFFSET ?",
+            params + [limit, (page - 1) * limit])
+        data = []
+        for r in rows:
+            data.append({
+                'stock_code': r['stock_code'],
+                'stock_name': r['stock_name'],
+                'strategy_name': r['strategy_name'],
+                'selection_date': r['selection_date'],
+                'selection_price': r['selection_price'],
+                'score': r['score'],
+                'strategy_count': r['strategy_count'],
+                'industry': r.get('industry') or '',
+            })
+        return jsonify({'success': True, 'total': total, 'page': page, 'limit': limit, 'data': data})
     except Exception as e:
         logger.error(f"查询选股历史失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'error': str(e)
-        })
-
-
-@app.route('/api/selection-continuity', methods=['GET'])
-def get_selection_continuity():
-    """
-    统计连续几天选股的差异情况
-
-    参数：
-        days: 统计最近N个选股日（默认5，最大30）
-
-    返回：
-        {
-            'success': True,
-            'dates': [...],              # 选股日期（升序）
-            'daily': [{'date','count','stocks':[{'code','name','strategies'}]}],
-            'continuity': [{'code','name','consecutive_days','appear_days','dates'}],  # 连续>=2天，按连续天数降序
-            'diff': [{'date','count','added':[codes],'removed':[codes]}]
-        }
-    """
-    try:
-        days = int(request.args.get('days', 5))
-        days = max(2, min(days, 30))
-        from utils.global_db import get_global_db
-        db = get_global_db()
-
-        date_rows = db.query("""
-            SELECT DISTINCT selection_date FROM stock_selection_record
-            WHERE is_active = 1 AND selection_date IS NOT NULL
-            ORDER BY selection_date DESC LIMIT ?
-        """, (days,))
-        dates = sorted([r['selection_date'] for r in date_rows])
-        if not dates:
-            return jsonify({'success': True, 'dates': [], 'daily': [], 'continuity': [], 'diff': []})
-
-        daily = []
-        for d in dates:
-            recs = db.query("""
-                SELECT stock_code, stock_name, strategy_name
-                FROM stock_selection_record
-                WHERE selection_date = ? AND is_active = 1
-            """, (d,))
-            stocks = [{'code': r['stock_code'], 'name': r['stock_name'],
-                       'strategies': r.get('strategy_name') or ''} for r in recs]
-            daily.append({'date': d, 'count': len(stocks), 'stocks': stocks})
-
-        # 每只股票在选股日序列中的出现
-        date_index = {d: i for i, d in enumerate(dates)}
-        stock_days = {}
-        for day in daily:
-            for s in day['stocks']:
-                code = s['code']
-                if code not in stock_days:
-                    stock_days[code] = {'name': s['name'], 'idx': []}
-                stock_days[code]['idx'].append(date_index[day['date']])
-
-        # 连续天数（在选股日序列中连续出现的最大长度）
-        continuity = []
-        for code, info in stock_days.items():
-            idxs = sorted(set(info['idx']))
-            max_len = 1
-            cur = 1
-            for i in range(1, len(idxs)):
-                if idxs[i] == idxs[i - 1] + 1:
-                    cur += 1
-                    if cur > max_len:
-                        max_len = cur
-                else:
-                    cur = 1
-            if max_len >= 2:
-                continuity.append({
-                    'code': code,
-                    'name': info['name'],
-                    'consecutive_days': max_len,
-                    'appear_days': len(idxs),
-                    'dates': [dates[i] for i in idxs]
-                })
-        continuity.sort(key=lambda x: (-x['consecutive_days'], -x['appear_days']))
-
-        # 每日差异（相对前一选股日）
-        diff = []
-        for i, day in enumerate(daily):
-            cur_codes = {s['code'] for s in day['stocks']}
-            if i == 0:
-                diff.append({'date': day['date'], 'count': day['count'], 'added': [], 'removed': []})
-            else:
-                prev_codes = {s['code'] for s in daily[i - 1]['stocks']}
-                added = [s['code'] for s in day['stocks'] if s['code'] not in prev_codes]
-                removed = [s['code'] for s in daily[i - 1]['stocks'] if s['code'] not in cur_codes]
-                diff.append({'date': day['date'], 'count': day['count'], 'added': added, 'removed': removed})
-
-        return jsonify({'success': True, 'dates': dates, 'daily': daily,
-                        'continuity': continuity, 'diff': diff})
-    except Exception as e:
-        logger.error(f"统计连续选股失败: {str(e)}")
         return jsonify({'success': False, 'error': str(e)})
 
 
-# ==================== 股票分析相关路由 ====================
+@app.route('/api/selection-track', methods=['GET'])
+def get_selection_track():
+    """统一选股跟踪：展示所有被选入的股票（当前持有 + 已退出/清仓）
 
-
-
-
-@app.route('/api/analyze-stock', methods=['POST'])
-def analyze_stock():
-    """
-    分析股票
-    
     参数：
-        stock_code: 股票代码
-        period: 分析周期
-    
+        hold_status: holding=仅持有 / sold=仅卖出 / 空=全部
+        strategy_name: 策略名筛选（与 strategy_hold_record.strategy_name 一致，类名）
+        stock_name: 股票名称模糊查询
+        sort_by: yield=累计收益率(默认) / strategy=策略名（默认降序）
+        sort_order: desc(默认) / asc
+        page / limit: 分页，默认 1 / 20
+
     返回：
-        {
-            'success': True,
-            'data': 分析结果
-        }
+        {success, total, page, limit, data:[{stock_code, stock_name, entry_date, exit_date,
+          score, buy_price, current_price, sell_price, cum_return, strategy_name,
+          exit_reason, status, weak_level, strong_level}]}
     """
     try:
-        # 获取请求参数
-        data = request.json or {}
-        stock_code = data.get('stock_code', '')
-        period = data.get('period', '30d')
-        
-        if not stock_code:
-            return jsonify({'success': False, 'message': '股票代码不能为空'})
-        
-        # 分析股票
-        analysis_result = stock_analyzer.analyze(stock_code, period=period)
-        
-        if not analysis_result:
-            return jsonify({'success': False, 'message': '分析失败'})
-        
-        # 转换numpy类型为Python原生类型，同时清理NaN/Infinity
-        def convert_numpy_types(obj):
-            """递归转换numpy类型，将NaN/Infinity替换为None"""
-            if isinstance(obj, dict):
-                return {k: convert_numpy_types(v) for k, v in obj.items()}
-            elif isinstance(obj, list):
-                return [convert_numpy_types(item) for item in obj]
-            # 先检查float类型的NaN/Infinity（含numpy.floating）
-            elif isinstance(obj, float):
-                if math.isnan(obj) or math.isinf(obj):
-                    return None
-                return obj
-            elif hasattr(obj, 'item'):
-                # numpy标量类型，先转为Python原生类型再检查NaN
-                val = obj.item()
-                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-                    return None
-                return val
-            elif isinstance(obj, np.ndarray):
-                return convert_numpy_types(obj.tolist())
-            elif isinstance(obj, pd.Timestamp):
-                return obj.strftime('%Y-%m-%d %H:%M:%S')
-            # 使用hasattr检查其他numpy类型
-            elif hasattr(obj, 'dtype'):
-                val = obj.item()
-                if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
-                    return None
-                return val
+        hold_status = (request.args.get('hold_status') or '').strip()
+        strategy_name = (request.args.get('strategy_name') or '').strip()
+        stock_name = (request.args.get('stock_name') or '').strip()
+        sort_by = (request.args.get('sort_by') or 'yield').strip()
+        sort_order = (request.args.get('sort_order') or 'desc').strip()
+        try:
+            page = max(1, int(request.args.get('page', 1)))
+        except (ValueError, TypeError):
+            page = 1
+        try:
+            limit = max(1, min(200, int(request.args.get('limit', 20))))
+        except (ValueError, TypeError):
+            limit = 20
+
+        from utils.global_db import get_global_db
+        dbm = get_global_db()
+        # 加载策略中文名映射（类名 -> display_name）
+        import yaml as _y
+        from pathlib import Path as _P
+        try:
+            with open(_P(__file__).resolve().parent / 'config' / 'strategy_params.yaml', 'r', encoding='utf-8') as _f:
+                _scfg = _y.safe_load(_f) or {}
+        except Exception:
+            _scfg = {}
+        _dmap = {k: (v or {}).get('display_name', k) for k, v in (_scfg.get('strategies') or {}).items()}
+
+        _px_cache = {}   # (code,date|None) -> close
+
+        def _close_at(code, date):
+            key = (code, date or '')
+            if key in _px_cache:
+                return _px_cache[key]
+            val = None
+            try:
+                df = dbm.read_stock(code)
+                if df is not None and not df.empty:
+                    import pandas as _pd
+                    dcol = df['date'] if 'date' in df.columns else df.index
+                    if date:
+                        row = df[_pd.to_datetime(dcol) == _pd.to_datetime(date)]
+                        if not row.empty:
+                            val = float(row.iloc[0]['close'])
+                    else:
+                        val = float(df.iloc[0]['close'])
+            except Exception:
+                pass
+            _px_cache[key] = val
+            return val
+
+        _wk_cache = {}
+        def _strength(code):
+            """走强/走弱互斥：返回 (level, label)，label 为真走强/假走强/真走弱/假走弱"""
+            if code not in _wk_cache:
+                try:
+                    from utils.weak_signal import compute_weak_signal
+                    from utils.strong_signal import compute_strong_signal
+                    _w = compute_weak_signal(dbm, code)
+                    _s = compute_strong_signal(dbm, code)
+                    _lv = _mutual_strength(_w, _s)
+                    _lb = ''
+                    if _lv.startswith('weak:'):
+                        _lb = '假走弱' if (_w or {}).get('falsify') else '真走弱'
+                    elif _lv.startswith('strong:'):
+                        _lb = '真走强' if (_s or {}).get('confirm') else '假走强'
+                    _wk_cache[code] = (_lv, _lb)
+                except Exception:
+                    _wk_cache[code] = ('none', '')
+            return _wk_cache[code]
+
+        records = []
+
+        # ---- 当前持有（持有）----
+        if hold_status in ('', 'holding'):
+            w = ["status IN ('observing','holding')"]
+            p = []
+            if strategy_name:
+                w.append("strategy_name = ?"); p.append(strategy_name)
+            rows = dbm.query(f"SELECT * FROM strategy_hold_record WHERE {' AND '.join(w)}", p)
+            for r in rows:
+                code, name = r['stock_code'], r['stock_name']
+                if stock_name and stock_name not in (name or ''):
+                    continue
+                st, slabel = _strength(code)
+                buy = float(r['hold_price'] or 0) or _close_at(code, r['hit_date']) or 0
+                cur = _close_at(code, None) or 0
+                ret = (cur / buy - 1) * 100 if buy else 0
+                status = '持有'
+                records.append({
+                    'stock_code': code, 'stock_name': name,
+                    'entry_date': r['hit_date'], 'exit_date': None,
+                    'score': round(float(r['score'] or 0), 2), 'buy_price': round(buy, 2),
+                    'current_price': round(cur, 2), 'sell_price': None,
+                    'cum_return': round(ret, 2),
+                    'strategy_name': _dmap.get(r['strategy_name'], r['strategy_name']),
+                    'strategy_key': r['strategy_name'],
+                    'exit_reason': r.get('select_reason') or r['reason'] or '',
+                    'status': status, 'strength_level': st, 'strength_label': slabel,
+                })
+
+        # ---- 已退出 / 清仓 ----
+        if hold_status in ('', 'sold'):
+            w = ["outcome IN ('replaced','discarded','sold')"]
+            p = []
+            if strategy_name:
+                w.append("strategy_name = ?"); p.append(strategy_name)
+            rows = dbm.query(f"SELECT * FROM strategy_hold_history WHERE {' AND '.join(w)}", p)
+            outcome_map = {'replaced': '切换', 'discarded': '舍弃', 'sold': '卖出'}
+            for r in rows:
+                code, name = r['stock_code'], r['stock_name']
+                if stock_name and stock_name not in (name or ''):
+                    continue
+                buy = _close_at(code, r['select_date']) or 0
+                _sp = float(r['sell_price']) if r.get('sell_price') is not None else None
+                sell = _sp if _sp is not None else (_close_at(code, r['evaluated_date']) or 0)
+                ret = (sell / buy - 1) * 100 if buy else 0
+                reason = outcome_map.get(r['outcome'], r['outcome'])
+                if r.get('sell_reason'):
+                    reason = f"{reason}: {r['sell_reason']}"
+                records.append({
+                    'stock_code': code, 'stock_name': name,
+                    'entry_date': r['select_date'], 'exit_date': r['evaluated_date'],
+                    'score': round(float(r['score'] or 0), 2), 'buy_price': round(buy, 2),
+                    'current_price': round(sell, 2), 'sell_price': round(sell, 2),
+                    'cum_return': round(ret, 2),
+                    'strategy_name': _dmap.get(r['strategy_name'], r['strategy_name']),
+                    'strategy_key': r['strategy_name'],
+                    'exit_reason': reason,
+                    'status': '清仓', 'strength_level': 'none', 'strength_label': '',
+                })
+
+        # ---- 同一股命中多策略合并为一条 ----
+        from collections import OrderedDict as _OD
+        _groups = _OD()
+        for _r in records:
+            _groups.setdefault(_r['stock_code'], []).append(_r)
+        records = []
+        for _code, _rs in _groups.items():
+            if len(_rs) == 1:
+                records.append(_rs[0]); continue
+            _names, _keys, _reasons = [], [], []
+            for _r in _rs:
+                if _r['strategy_name'] and _r['strategy_name'] not in _names: _names.append(_r['strategy_name'])
+                if _r['strategy_key'] and _r['strategy_key'] not in _keys: _keys.append(_r['strategy_key'])
+                if _r['exit_reason'] and _r['exit_reason'] not in _reasons: _reasons.append(_r['exit_reason'])
+            _has_hold = any(_r['status'] == '持有' for _r in _rs)
+            _base = min(_rs, key=lambda _x: _x['entry_date'] or '9999')
+            _m = dict(_base)
+            _m['strategy_name'] = ' + '.join(_names)
+            _m['strategy_key'] = ','.join(_keys)
+            _m['score'] = max([_x['score'] for _x in _rs if _x['score'] is not None] or [_base['score']])
+            _m['entry_date'] = min([_x['entry_date'] for _x in _rs if _x['entry_date']] or [_base['entry_date']])
+            if _has_hold:
+                _h = min([_x for _x in _rs if _x['status'] == '持有'], key=lambda _x: _x['entry_date'] or '9999')
+                _m['status'] = '持有'; _m['exit_date'] = None; _m['sell_price'] = None
+                _m['buy_price'] = _h['buy_price']; _m['current_price'] = _h['current_price']; _m['cum_return'] = _h['cum_return']
+                _m['exit_reason'] = _reasons[0] if _reasons else ''
             else:
-                return obj
-        
-        # 转换分析结果
-        analysis_result = convert_numpy_types(analysis_result)
-        
-        # 使用json.dumps并指定default参数来处理所有numpy类型
-        import json
-        def default_handler(obj):
-            """处理json.dumps无法序列化的类型"""
-            if isinstance(obj, np.integer):
-                return int(obj)
-            elif isinstance(obj, np.floating):
-                # 检查NaN/Infinity
-                val = float(obj)
-                if math.isnan(val) or math.isinf(val):
-                    return None
-                return val
-            elif isinstance(obj, np.ndarray):
-                return convert_numpy_types(obj.tolist())
-            elif isinstance(obj, pd.Timestamp):
-                return obj.strftime('%Y-%m-%d %H:%M:%S')
+                _sold = max(_rs, key=lambda _x: _x['exit_date'] or '')
+                _m['status'] = '清仓'; _m['exit_date'] = max([_x['exit_date'] for _x in _rs if _x['exit_date']] or [_base['exit_date']])
+                _m['buy_price'] = _sold['buy_price']; _m['current_price'] = _sold['current_price']; _m['sell_price'] = _sold['sell_price']; _m['cum_return'] = _sold['cum_return']
+                _m['exit_reason'] = '；'.join(_reasons)
+            records.append(_m)
+
+        # ---- 排序（默认降序）----
+        def _sort_key(rec):
+            return rec['strategy_name'] if sort_by == 'strategy' else rec['cum_return']
+        records.sort(key=_sort_key, reverse=(sort_order != 'asc'))
+
+        total = len(records)
+        start = (page - 1) * limit
+        page_data = records[start:start + limit]
+        return jsonify({'success': True, 'total': total, 'page': page, 'limit': limit, 'data': page_data})
+    except Exception as e:
+        logger.error(f"查询选股跟踪失败: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/selection-track/manual-edit', methods=['POST'])
+def manual_edit_selection_track():
+    """人工修改选股跟踪记录：标记卖出 / 更新卖出时间与卖出价格
+
+    参数(JSON)：strategy_key(类名), stock_code, sell_date(YYYY-MM-DD), sell_price(可空)
+    逻辑：
+      - 若该策略当前存在活跃持有(observing/holding)且为该股票 → 人工标记卖出
+        （写 history(sold) + 持有置 sold 终止锁定）
+      - 否则若已存在 outcome='sold' 历史 → 更新其 evaluated_date(sell_date) / sell_price
+    """
+    try:
+        body = request.get_json(silent=True) or {}
+        strategy_key = (body.get('strategy_key') or '').strip()
+        stock_code = (body.get('stock_code') or '').strip()
+        sell_date = (body.get('sell_date') or '').strip()
+        raw_price = body.get('sell_price')
+        if not strategy_key or not stock_code:
+            return jsonify({'success': False, 'error': '缺少策略或股票代码'})
+        if sell_date and len(sell_date) != 10:
+            return jsonify({'success': False, 'error': '卖出日期格式应为 YYYY-MM-DD'})
+        sell_price = None
+        if raw_price is not None and raw_price != '' and raw_price != 'null':
+            try:
+                sell_price = float(raw_price)
+            except (ValueError, TypeError):
+                return jsonify({'success': False, 'error': '卖出价格无效'})
+        from utils.global_db import get_global_db
+        from utils.strategy_hold_manager import StrategyHoldManager
+        dbm = get_global_db()
+        hold_mgr = StrategyHoldManager(dbm)
+        # 同股命中多策略：一次卖出整体释放该股名下所有策略的活跃持有
+        active = dbm.query(
+            "SELECT * FROM strategy_hold_record WHERE stock_code=? AND status IN ('observing','holding')",
+            (stock_code,))
+        if active:
+            sold_n = 0
+            for h in active:
+                try:
+                    hold_mgr._manual_sell(h['strategy_name'], h, sell_date or '', sell_price)
+                    sold_n += 1
+                except Exception as _e:
+                    logger.warning(f"整体释放卖出失败 {h.get('strategy_name')}/{stock_code}: {_e}")
+            return jsonify({'success': True, 'action': 'mark_sold',
+                            'msg': f'已人工标记卖出 {stock_code}（{sold_n} 条策略全部释放）'})
+        rows = dbm.query(
+            "SELECT id FROM strategy_hold_history WHERE strategy_name=? AND stock_code=? AND outcome='sold' ORDER BY id DESC LIMIT 1",
+            (strategy_key, stock_code))
+        if rows:
+            rid = rows[0]['id']
+            upd = {}
+            if sell_date:
+                upd['evaluated_date'] = sell_date
+            if sell_price is not None:
+                upd['sell_price'] = sell_price
+            if upd:
+                sets = ', '.join(f"{k}=?" for k in upd)
+                dbm.execute_with_retry(f"UPDATE strategy_hold_history SET {sets} WHERE id=?", list(upd.values()) + [rid])
+            return jsonify({'success': True, 'action': 'update_history', 'msg': '已更新卖出时间/价格'})
+        return jsonify({'success': False, 'error': '未找到该策略下的持有或已卖出记录'})
+    except Exception as e:
+        logger.error(f"人工修改选股跟踪失败: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/selection-track/regenerate', methods=['POST'])
+def regenerate_selection_track():
+    """重新生成选股跟踪：对当前持有标的重算评分、强弱标志、卖出信号并回写
+
+    对 strategy_hold_record（observing/holding）逐条：
+      - 重算综合评分（calculate_stock_score，取最近交易日）回写 score
+      - 重算走弱/走强多维共振等级（weak_signal / strong_signal）
+      - 重算统一卖出信号（compute_sell_signal，从命中日扫描到最近交易日）
+        命中卖出时在 reason 上标注「触发卖出: xxx」（不改变 status 状态机，实际卖出仍由执行选股触发）
+    返回每条重算结果与统计，前端据此刷新列表。
+    """
+    try:
+        from utils.global_db import get_global_db
+        dbm = get_global_db()
+        # 加载策略中文名映射（类名 -> display_name）
+        import yaml as _y
+        from pathlib import Path as _P
+        try:
+            with open(_P(__file__).resolve().parent / 'config' / 'strategy_params.yaml', 'r', encoding='utf-8') as _f:
+                _scfg = _y.safe_load(_f) or {}
+        except Exception:
+            _scfg = {}
+        _dmap = {k: (v or {}).get('display_name', k) for k, v in (_scfg.get('strategies') or {}).items()}
+
+        from trading.stock_score_api import calculate_stock_score
+        from utils.sell_signal import compute_sell_signal
+        from utils.weak_signal import compute_weak_signal
+        from utils.strong_signal import compute_strong_signal
+
+        latest = get_latest_trading_date()
+        rows = dbm.query(
+            "SELECT * FROM strategy_hold_record WHERE status IN ('observing','holding')")
+        results = []
+        sold_count = 0
+
+        for r in rows:
+            code, name, stg = r['stock_code'], r['stock_name'], r['strategy_name']
+            # 重算评分
+            try:
+                score = float(calculate_stock_score(code, latest))
+            except Exception:
+                score = float(r['score'] or 0)
+            # 重算强弱（互斥：weak / strong / none，只记录一个状态）
+            st = 'none'; slabel = ''
+            try:
+                _w = compute_weak_signal(dbm, code)
+                _s = compute_strong_signal(dbm, code)
+                st = _mutual_strength(_w, _s)
+                if st.startswith('weak:'):
+                    slabel = '假走弱' if (_w or {}).get('falsify') else '真走弱'
+                elif st.startswith('strong:'):
+                    slabel = '真走强' if (_s or {}).get('confirm') else '假走强'
+            except Exception:
+                pass
+            # 重算卖出信号（命中价 = hold_price，缺则取命中日收盘价）
+            hit_price = float(r['hold_price'] or 0) or None
+            if not hit_price:
+                try:
+                    df = dbm.read_stock(code)
+                    if df is not None and not df.empty:
+                        import pandas as _pd
+                        dcol = df['date'] if 'date' in df.columns else df.index
+                        row0 = df[_pd.to_datetime(dcol) == _pd.to_datetime(r['hit_date'])]
+                        if not row0.empty:
+                            hit_price = float(row0.iloc[0]['close'])
+                except Exception:
+                    pass
+            sell_status, sell_reason = '持有', ''
+            # 1) 真走弱（多维确认走弱且未被证伪）→ 自动卖出（重新生成无新候选替换，走弱即终止）
+            if st.startswith('weak:') and _w and not (_w or {}).get('falsify'):
+                sell_status = '卖出'
+                _ws = (_w or {}).get('signals') or []
+                sell_reason = '真走弱自动卖出: ' + ('、'.join(str(x) for x in _ws) if _ws else '多维确认走弱')
+                sold_count += 1
+            # 2) 独立卖出信号（达到卖出标准同样触发卖出）
+            elif hit_price:
+                try:
+                    sell = compute_sell_signal(dbm, code, hit_price, r['hit_date'])
+                    if sell and sell.get('sell_status') == '卖出':
+                        sell_status = '卖出'
+                        sell_reason = sell.get('sell_reason') or ''
+                        sold_count += 1
+                except Exception:
+                    pass
+            # 卖出=终止：命中卖出则迁移历史并终止该持有（移出活跃集，后续 regenerate 不再更新、数据锁定）
+            new_reason = r['reason'] or ''
+            if sell_status == '卖出':
+                try:
+                    from utils.strategy_hold_manager import StrategyHoldManager as _SHM
+                    _SHM(dbm).release_stock_all(code, sell_reason, latest)
+                except Exception as e:
+                    logger.warning(f"重新生成整体释放卖出失败 {code}: {e}")
             else:
-                return obj
-        
-        response_data = {
-            'success': True,
-            'data': analysis_result
-        }
-        json_str = json.dumps(response_data, default=default_handler)
-        return app.response_class(
-            response=json_str,
-            mimetype='application/json'
-        )
-        
+                # 未卖出：正常更新评分/标注（仅限活跃记录，绝不触碰已卖出/终止记录）
+                try:
+                    dbm.execute_with_retry(
+                        "UPDATE strategy_hold_record SET score=?, reason=?, updated_at=datetime('now') WHERE strategy_name=? AND stock_code=? AND status IN ('observing','holding')",
+                        (score, new_reason, stg, code))
+                except Exception as e:
+                    logger.warning(f"重新生成更新持有失败 {stg}: {e}")
+            results.append({
+                'stock_code': code, 'stock_name': name,
+                'strategy_name': _dmap.get(stg, stg),
+                'score': round(score, 2), 'strength_level': st, 'strength_label': slabel,
+                'sell_status': sell_status, 'sell_reason': sell_reason,
+            })
+
+        return jsonify({'success': True, 'total': len(rows), 'sold_count': sold_count,
+                        'score_date': latest, 'data': results})
     except Exception as e:
-        logger.error(f"分析股票失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': str(e)
-        })
+        logger.error(f"重新生成选股跟踪失败: {str(e)}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/api/analysis-history')
-def get_analysis_history():
-    """
-    获取分析历史
-    
-    返回：
-        {
-            'success': True,
-            'data': 分析历史列表
-        }
-    """
-    try:
-        # 这里简化处理，实际应该从数据库获取
-        # 暂时返回模拟数据
-        history = [
-            {
-                'id': 1,
-                'stock_code': '600519',
-                'stock_name': '贵州茅台',
-                'analysis_time': '2026-03-23 10:00:00',
-                'rating': '买入'
-            },
-            {
-                'id': 2,
-                'stock_code': '000858',
-                'stock_name': '五粮液',
-                'analysis_time': '2026-03-22 15:30:00',
-                'rating': '中性'
-            }
-        ]
-        
-        return jsonify({
-            'success': True,
-            'data': history
-        })
-        
-    except Exception as e:
-        logger.error(f"获取分析历史失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': str(e)
-        })
+@app.route('/api/weak-signal', methods=['GET'])
+def get_weak_signal():
+    """多维弱转共振判定（统一弱转标志，供选股/排名/个股分析等功能复用）
 
-
-@app.route('/api/export-report')
-def export_report():
-    """
-    导出分析报告
-    
     参数：
-        stock_code: 股票代码
-    
+        stock_code: 股票代码（必填）
+        lookback: 动量"创N日新低"回看窗口，默认20（5~120）
+
     返回：
-        报告文件
+        {success, code, lookback,
+         level: none|warning|confirmed|trend_weak,
+         weak_score: 0~100,
+         trend_bear: 趋势方向是否转空,
+         falsify: 连续3日收回关键均线→走弱证伪,
+         signals: [触发信号],
+         dims: {趋势/量能/动量/相对 各维度明细}}
     """
     try:
-        stock_code = request.args.get('stock_code', '')
-        
-        if not stock_code:
-            return jsonify({'success': False, 'message': '股票代码不能为空'})
-        
-        # 生成报告
-        report_content, report_path = stock_analyzer.generate_report(stock_code)
-        
-        # 返回报告文件
-        return send_from_directory(
-            directory=str(Path(report_path).parent),
-            path=Path(report_path).name,
-            as_attachment=True
-        )
-        
+        code = (request.args.get('stock_code') or '').strip()
+        if not code:
+            return jsonify({'success': False, 'error': '缺少 stock_code 参数'})
+        lookback = request.args.get('lookback', 20)
+        try:
+            lookback = max(5, min(int(lookback), 120))
+        except (ValueError, TypeError):
+            lookback = 20
+        from utils.weak_signal import compute_weak_signal
+        from utils.global_db import get_global_db
+        w = compute_weak_signal(get_global_db(), code, lookback=lookback)
+        return jsonify({'success': True, 'code': code, 'lookback': lookback, **w})
     except Exception as e:
-        logger.error(f"导出报告失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': str(e)
-        })
+        logger.error(f"弱转共振判定接口异常: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
-@app.route('/api/report/<int:report_id>')
-def get_report(report_id):
-    """
-    获取分析报告
-    
+@app.route('/api/strong-signal', methods=['GET'])
+def get_strong_signal():
+    """多维走强共振判定（统一走强标志，供选股/排名/个股分析等功能复用，与 /api/weak-signal 对称）
+
     参数：
-        report_id: 报告ID
-    
+        stock_code: 股票代码（必填）
+        lookback: 动量"创N日新高"回看窗口，默认20（5~120）
+
     返回：
-        报告内容
+        {success, code, lookback,
+         level: none|appear|confirmed|trend_up,
+         strong_score: 0~100,
+         trend_up: 趋势方向是否已转多,
+         confirm: 回踩不破MA20→走强证真,
+         signals: [触发信号],
+         dims: {趋势/量能/动量/相对 各维度明细}}
     """
     try:
-        # 这里简化处理，实际应该根据ID获取报告
-        # 暂时返回模拟数据
-        return jsonify({
-            'success': True,
-            'message': '报告获取功能暂未实现'
-        })
-        
+        code = (request.args.get('stock_code') or '').strip()
+        if not code:
+            return jsonify({'success': False, 'error': '缺少 stock_code 参数'})
+        lookback = request.args.get('lookback', 20)
+        try:
+            lookback = max(5, min(int(lookback), 120))
+        except (ValueError, TypeError):
+            lookback = 20
+        from utils.strong_signal import compute_strong_signal
+        from utils.global_db import get_global_db
+        s = compute_strong_signal(get_global_db(), code, lookback=lookback)
+        return jsonify({'success': True, 'code': code, 'lookback': lookback, **s})
     except Exception as e:
-        logger.error(f"获取报告失败: {str(e)}")
-        return jsonify({
-            'success': False,
-            'message': str(e)
-        })
+        logger.error(f"走强共振判定接口异常: {e}")
+        return jsonify({'success': False, 'error': str(e)})
 
 
 # ==================== K线初始化 API ====================
@@ -4012,9 +4243,6 @@ def get_strategy_runner(auto_init=False):
             logger.error(f"初始化错误堆栈: {traceback.format_exc()}")
             strategy_runner = None
     return strategy_runner
-
-
-
 
 
 @app.route('/api/strategy/run-batch', methods=['POST'])

@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 # 自定义 Tushare 接口地址（见 config/tushare.md，必须设置否则无法获取数据）
 TUSHARE_HTTP_URL = "https://tuaremax.top"
 
+# tuaremax.top 的真实公网 IP（本机代理工具 fake-ip 会把该域名解析到保留地址 198.18.0.217 导致不可达；
+# 经 223.5.5.5/8.8.8.8 公网 DNS 验证真实 IP 为 124.156.169.109，直连可达）。进程内强制覆盖解析用。
+TUSHARE_REAL_IP = "124.156.169.109"
+
 # 全局限流默认值：每分钟 300 次（规范区间 300~400 的下界，保守安全）
 DEFAULT_MAX_CALLS = 380
 DEFAULT_PERIOD = 60.0
@@ -104,6 +108,35 @@ def _get_global_session():
     return _SESSION_POOL
 
 
+
+
+def _install_real_ip_resolver():
+    """进程内把 tuaremax.top 强制解析到真实公网 IP，绕过本机代理 fake-ip 劫持（幂等）
+
+    本机代理工具（Clash/Surge 等 fake-ip 模式）会把 tuaremax.top 解析到保留地址
+    198.18.0.217，导致 SSL 握手失败/超时。此处仅拦截该域名、返回已验证的真实 IP，
+    其余域名解析不受影响。真实 IP 失效时自动回退系统解析（不影响降级逻辑）。
+    """
+    import socket
+    global _real_ip_installed
+    if globals().get('_real_ip_installed'):
+        return
+    _real_gai = socket.getaddrinfo
+
+    def _gai(host, *a, **k):
+        if isinstance(host, str) and host == 'tuaremax.top':
+            ip = TUSHARE_REAL_IP
+            try:
+                return _real_gai(ip, *a, **k)
+            except Exception:
+                pass
+        return _real_gai(host, *a, **k)
+
+    socket.getaddrinfo = _gai
+    globals()['_real_ip_installed'] = True
+    logger.debug("已为 tuaremax.top 注入真实 IP 解析（绕过 fake-ip）")
+
+
 def _inject_session_pool():
     """
     将 Tushare 库内部请求改用共享 Session（连接池复用），幂等。
@@ -169,6 +202,7 @@ def get_pro(token: str = None):
         pro._DataApi__http_url = TUSHARE_HTTP_URL
         # 启用连接池复用（幂等）
         _inject_session_pool()
+        _install_real_ip_resolver()
         # 返回限流代理，全局统一限速
         return _ThrottledPro(pro, _get_global_limiter())
     except Exception as e:

@@ -81,37 +81,25 @@ class MultiGoldenCrossStrategy(BaseStrategy):
         low = result['low']
         volume = result['volume']
         
-        # 计算均线
-        result['ma_short'] = close.rolling(window=self.params['ma_short_period'], min_periods=1).mean()
-        result['ma_long'] = close.rolling(window=self.params['ma_long_period'], min_periods=1).mean()
-        
-        # 计算KDJ指标
+        # 计算均线（官方优先，顺序无关）
+        from utils import technical as _tech
+        result['ma_short'] = _tech.ma_norm(result, self.params['ma_short_period'])
+        result['ma_long'] = _tech.ma_norm(result, self.params['ma_long_period'])
+
+        # 计算KDJ指标（官方优先）
         n = self.params['kdj_n']
         m1 = self.params['kdj_m1']
         m2 = self.params['kdj_m2']
-        
-        # RSV计算
-        lowest_low = low.rolling(window=n, min_periods=1).min()
-        highest_high = high.rolling(window=n, min_periods=1).max()
-        rsv = (close - lowest_low) / (highest_high - lowest_low) * 100
-        rsv = rsv.fillna(50)
-        
-        # K、D、J计算 - 使用向量化操作
-        kdj_m1 = self.params['kdj_m1']
-        kdj_m2 = self.params['kdj_m2']
-        k_values = rsv.ewm(alpha=1/kdj_m1, adjust=False).mean()
-        d_values = k_values.ewm(alpha=1/kdj_m2, adjust=False).mean()
-        
-        result['K'] = k_values
-        result['D'] = d_values
-        result['J'] = 3 * k_values - 2 * d_values
-        
-        # 计算MACD指标
-        ema_short = close.ewm(span=self.params['macd_short'], adjust=False).mean()
-        ema_long = close.ewm(span=self.params['macd_long'], adjust=False).mean()
-        result['DIF'] = ema_short - ema_long
-        result['DEA'] = result['DIF'].ewm(span=self.params['macd_signal'], adjust=False).mean()
-        result['MACD'] = (result['DIF'] - result['DEA']) * 2
+        _kdj = _tech.KDJ(result, n, m1, m2)
+        result['K'] = _kdj['K']
+        result['D'] = _kdj['D']
+        result['J'] = _kdj['J']
+
+        # 计算MACD指标（官方优先）
+        _macd = _tech.MACD(result, self.params['macd_short'], self.params['macd_long'], self.params['macd_signal'])
+        result['DIF'] = _macd['macd']
+        result['DEA'] = _macd['macd_signal']
+        result['MACD'] = _macd['macd_hist']
         
         # 计算成交量比
         result['volume_ma'] = volume.rolling(window=5, min_periods=1).mean()

@@ -232,6 +232,14 @@ CREATE TABLE IF NOT EXISTS stock_selection_record (
     -- is_active: 是否活跃，类型INTEGER，必填，默认1，1表示活跃，0表示已删除
     strategy_count INTEGER NOT NULL DEFAULT 1,
     -- strategy_count: 命中策略个数，类型INTEGER，必填，默认1
+    sell_status VARCHAR(20),
+    -- sell_status: 卖点状态，类型VARCHAR(20)，可选，'卖出'/'持有'
+    sell_price DECIMAL(10,2),
+    -- sell_price: 卖出价（卖点），类型DECIMAL(10,2)，可选
+    sell_reason TEXT,
+    -- sell_reason: 卖出原因，类型TEXT，可选
+    sell_yield DECIMAL(10,2),
+    -- sell_yield: 卖出后收益率(%)，类型DECIMAL(10,2)，可选
     UNIQUE(stock_code, selection_date)
     -- 股票代码和选入日期的组合唯一
 );

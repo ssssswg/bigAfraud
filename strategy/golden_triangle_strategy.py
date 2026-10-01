@@ -53,10 +53,11 @@ class GoldenTriangleStrategy(BaseStrategy):
         long_period = int(self.params['long_period'])
         super_long_period = int(self.params['super_long_period'])
 
-        result['sma_short'] = result['close'].rolling(window=short_period).mean()
-        result['sma_mid'] = result['close'].rolling(window=mid_period).mean()
-        result['sma_long'] = result['close'].rolling(window=long_period).mean()
-        result['sma_super_long'] = result['close'].rolling(window=super_long_period).mean()
+        from utils import technical as _tech
+        result['sma_short'] = _tech.ma_norm(result, short_period)
+        result['sma_mid'] = _tech.ma_norm(result, mid_period)
+        result['sma_long'] = _tech.ma_norm(result, long_period)
+        result['sma_super_long'] = _tech.ma_norm(result, super_long_period)
         result['volume_ma5'] = result['volume'].rolling(window=5).mean()
 
         result['prev_close'] = result['close'].shift(1)

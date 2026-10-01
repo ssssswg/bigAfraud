@@ -543,7 +543,7 @@ const StrategyRunnerModule = {
                             const currentPrice = parseFloat(pos.current_price) || 0;
                             const profitLoss = parseFloat(pos.profit_loss) || 0;
                             const profitLossPercent = parseFloat(pos.profit_loss_percent) || 0;
-                            const profitColor = profitLoss >= 0 ? '#22c55e' : '#ef4444';
+                            const profitColor = profitLoss >= 0 ? '#ef4444' : '#22c55e';
                             // 自动模式下不显示卖出按钮，显示提示文字
                             const actionCell = isAutoMode
                                 ? '<span style="color:#9ca3af; font-size:12px;">自动</span>'
@@ -557,7 +557,7 @@ const StrategyRunnerModule = {
                                 <td>¥${costPrice.toFixed(2)}</td>
                                 <td>¥${currentPrice.toFixed(2)}</td>
                                 <td style="color: ${profitColor}">${profitLoss >= 0 ? '+' : ''}¥${profitLoss.toFixed(2)}</td>
-                                <td style="color: ${profitLossPercent >= 0 ? '#22c55e' : '#ef4444'}">
+                                <td style="color: ${profitLossPercent >= 0 ? '#ef4444' : '#22c55e'}">
                                     ${profitLossPercent >= 0 ? '+' : ''}${profitLossPercent.toFixed(2)}%
                                 </td>
                                 <td>${pos.hold_days}</td>

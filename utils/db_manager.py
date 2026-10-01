@@ -16,6 +16,56 @@ from threading import Lock, RLock
 # 配置日志
 logger = logging.getLogger(__name__)
 
+# 按库粒度的共享写锁：同一库文件（db_path）的所有 DBManager 实例共用一把进程级写锁。
+# 背景：SQLite 写锁是库级（WAL 单写者），同库任何表的写都必须串行；
+# 项目存在多个 DBManager 实例（global_db / strategy_runner / scorer 等），
+# 各自持有独立 RLock 时写同一库会互相冲突（database is locked）。
+# 因此按 db_path 建锁：同库串行、不同库可并行。
+_GLOBAL_WRITE_LOCKS = {}            # db_path(str) -> RLock
+_GLOBAL_WRITE_LOCKS_GUARD = RLock() # 保护上面的 dict
+# ---- 写门闩（错峰）：K线更新等大写入独占写窗口，普通写有界等待 ----
+class _WriteGate:
+    """K线更新等大写入独占；普通写错峰（进入时有界等待，避免与大写入抢写锁）"""
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._bulk_count = 0
+        self._local = threading.local()  # 记录当前线程是否独占持有者
+
+    def begin_bulk(self):
+        """大写入开始：独占写窗口（同一时刻一个）"""
+        with self._cond:
+            while self._bulk_count > 0:
+                self._cond.wait()
+            self._bulk_count += 1
+            self._local.is_bulk = True
+
+    def end_bulk(self):
+        """大写入结束：释放独占窗口并唤醒等待者"""
+        with self._cond:
+            self._bulk_count -= 1
+            self._local.is_bulk = False
+            if self._bulk_count == 0:
+                self._cond.notify_all()
+
+    def enter_write(self, timeout=120.0):
+        """普通写进入：若当前线程是大写入者(自己)直接放行；
+        否则若有独占大写入则有界等待，超时返回 False（由上层重试/报错）"""
+        if getattr(self._local, 'is_bulk', False):
+            return True
+        with self._cond:
+            if self._bulk_count == 0:
+                return True
+            deadline = time.time() + timeout
+            while self._bulk_count > 0:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._cond.wait(remaining)
+            return True
+
+_WRITE_GATE = _WriteGate()
+
 
 class DBManager:
     """
@@ -50,8 +100,13 @@ class DBManager:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         # 线程锁，用于保护事务状态（RLock支持同一线程重入）
         self._lock = RLock()
-        # 全局写入锁，保证同一时刻只有一个写入事务（RLock支持重入）
-        self._write_lock = RLock()
+        # 写入锁：按库粒度共享，保证同一库文件同一时刻只有一个写入事务
+        # （RLock 支持同一线程重入；不同库文件之间可并行写）
+        _lock_key = str(self.db_path)
+        with _GLOBAL_WRITE_LOCKS_GUARD:
+            if _lock_key not in _GLOBAL_WRITE_LOCKS:
+                _GLOBAL_WRITE_LOCKS[_lock_key] = RLock()
+        self._write_lock = _GLOBAL_WRITE_LOCKS[_lock_key]
         # 线程本地存储，每个线程独立维护事务状态
         self._local = threading.local()
         # 线程本地连接池，key为线程ID，value为连接对象
@@ -201,6 +256,10 @@ class DBManager:
                 raise
 
         # 写语句：串行化写者（复用全局写锁，事务内已持锁则不重复获取）+ 锁冲突自动退避重试
+        # 错峰：非事务独立写，若有大写入(K线更新)独占窗口先有界等待
+        if not self._has_write_lock and self._tx_connection is None:
+            if not _WRITE_GATE.enter_write():
+                raise sqlite3.OperationalError('database is locked (大写入独占窗口)')
         acquired = not self._has_write_lock
         if acquired:
             self._write_lock.acquire()
@@ -211,6 +270,11 @@ class DBManager:
                     conn = self.connect()
                     cursor = conn.cursor()
                     cursor.execute(sql, params)
+                    # 独立写事务立即提交：避免写事务滞留连接（写锁在 RLock 释放后仍被该连接持有，
+                    # 导致其他线程的 execute 通过锁却撞上未提交事务而 database is locked）。
+                    # 事务内（begin_transaction，acquired=False）不提交，由外层统一管理。
+                    if acquired:
+                        conn.commit()
                     return cursor
                 except sqlite3.OperationalError as e:
                     if 'database is locked' in str(e) and attempt < max_retries - 1:
@@ -494,6 +558,9 @@ class DBManager:
         - 自动处理连接上残留的未提交事务（脏连接恢复）
         """
         if self._transaction_count == 0:
+            # 错峰：最外层事务进入前，若有大写入(K线更新)独占窗口先有界等待
+            if not _WRITE_GATE.enter_write():
+                raise sqlite3.OperationalError('database is locked (大写入独占窗口)')
             # 获取全局写入锁（阻塞直到获取成功）
             self._write_lock.acquire()
             # 标记当前线程持有写入锁
@@ -607,6 +674,16 @@ class DBManager:
                 self._has_write_lock = False
                 self._write_lock.release()
     
+    @staticmethod
+    def begin_bulk_write():
+        """开启大写入独占窗口（K线更新等耗时批量写使用）"""
+        _WRITE_GATE.begin_bulk()
+
+    @staticmethod
+    def end_bulk_write():
+        """结束大写入独占窗口"""
+        _WRITE_GATE.end_bulk()
+
     @contextmanager
     def transaction(self):
         """

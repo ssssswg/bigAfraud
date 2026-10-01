@@ -241,10 +241,25 @@ class QuantSystem:
 
         print(f"有效股票: {len(valid_stocks)} 只")
 
+        # 批量预热全市场当日官方因子（选股提速核心：1 次请求替代逐只 400 天拉取）
+        try:
+            from utils import technical as _tech
+            _sample = next(iter(valid_stocks.values()), (None, None))[1]
+            _td = str(_sample['date'].max())[:10].replace('-', '') if _sample is not None and not _sample.empty else None
+            if _td:
+                _n = _tech.prefetch_official_factor_batch(trade_date=_td)
+                print(f"批量预热官方因子完成，命中 {_n} 只（trade_date={_td}）")
+        except Exception as _e:
+            print(f"批量预热官方因子失败: {_e}")
+
         # 并行执行策略
         from concurrent.futures import ThreadPoolExecutor, as_completed
         import os
         _max_workers = min(os.cpu_count() or 4, len(self.registry.strategies), 8)
+
+        # 每轮选股刷新每股指标缓存（跨策略复用，避免跨轮串扰）
+        from utils import technical as _tech_c
+        _tech_c.clear_indicator_cache()
 
         results = {}
         indicators_dict = {}
@@ -253,9 +268,11 @@ class QuantSystem:
         def _run_strategy(item):
             sname, sobj = item
             sigs = []
+            from utils import technical as _tech
             for code, (name, df) in valid_stocks.items():
                 try:
-                    df_ind = sobj.calculate_indicators(df)
+                    with _tech.official_factor_scope(code, df):
+                        df_ind = sobj.calculate_indicators(df)
                     sl = sobj.select_stocks(df_ind, name)
                     if sl:
                         for s in sl:
@@ -337,7 +354,25 @@ class QuantSystem:
         
         # 使用过滤后的结果
         results = filtered_results
-        
+
+        # 方案C：对候选股补拉 400 天官方历史（历史100%官方，供最终判定/推荐价格）
+        try:
+            from utils import technical as _tech
+            _cands = []
+            for _sigs in results.values():
+                if not isinstance(_sigs, list):
+                    continue
+                for _s in _sigs:
+                    _c = _s.get('code') if isinstance(_s, dict) else _s
+                    if _c:
+                        _cands.append(_c)
+            _cands = list(dict.fromkeys(_cands))
+            if _cands:
+                _n = _tech.prefetch_official_factor_history(codes=_cands)
+                print(f"候选股补拉400天官方历史完成，命中 {_n}/{len(_cands)} 只")
+        except Exception as _e:
+            print(f"候选股补拉官方历史失败: {_e}")
+
         # 如果需要返回数据字典（用于K线图生成）
         if return_data:
             # 返回计算了指标的数据（包含趋势线）
@@ -744,167 +779,72 @@ B1完美图形匹配:
                     cfg_path = Path("config/strategy_params.yaml")
                     if cfg_path.exists():
                         with open(cfg_path, 'r', encoding='utf-8') as _f:
-                            _cfg = _yaml.safe_load(_f) or {}
-                        for _k, _v in _cfg.get('strategies', {}).items():
+                            _cfg2 = _yaml.safe_load(_f) or {}
+                        for _k, _v in _cfg2.get('strategies', {}).items():
                             display_names[_k] = _v.get('display_name', _k)
                 except Exception:
                     pass
 
-                lines = [f"📊 缅A每日推送 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})", ""]
-                total = 0
-                all_stocks = []
-                if isinstance(result, dict):
-                    for strategy_name, signals in result.items():
-                        if signals:
-                            cn_name = display_names.get(strategy_name, strategy_name)
-                            lines.append(f"【{cn_name}】: {len(signals)} 只")
-                            for s in signals:
-                                name = s.get('name', '')
-                                code = s.get('code', '')
-                                sig = s.get('signals', [])
-                                if sig:
-                                    lines.append(f"  {code} {name} 价格:{sig[0].get('close','-')}")
-                                else:
-                                    lines.append(f"  {code} {name}")
-                                all_stocks.append({'code': code, 'name': name})
-                            lines.append("")
-                            total += len(signals)
+                # 收集股票 + 各自命中的策略（去重，策略名转中文）
+                _all_stocks = []
+                _stock_strategies = {}   # code -> [策略名]
+                _stock_prices = {}       # code -> 价格
+                for _sname, _signals in result.items():
+                    _cn = display_names.get(_sname, _sname)
+                    if isinstance(_signals, list) and _signals:
+                        for _s in _signals:
+                            _code = _s.get('code', '')
+                            _name = _s.get('name', '')
+                            _sig = _s.get('signals', [])
+                            if _code:
+                                if _code not in _stock_strategies:
+                                    _stock_strategies[_code] = []
+                                    _stock_prices[_code] = _sig[0].get('close', '-') if _sig else '-'
+                                    _all_stocks.append({'code': _code, 'name': _name})
+                                _stock_strategies[_code].append(_cn)
+                _total = len(_all_stocks)
 
-                # 与上一日对比：新增/去除
-                if total > 0:
-                    try:
-                        from utils.selection_record_manager import SelectionRecordManager
-                        from datetime import date as _date
-                        _srm = SelectionRecordManager()
-                        _today_codes = {s['code'] for s in all_stocks}
-                        _today_str = datetime.now().strftime('%Y-%m-%d')
+                # ── 使用统一推送模板构建唯一消息（模板二：持仓操作）──
+                from utils.push_templates import build_message, strength_label
+                from simple_analyzer import analyze_stock, generate_advice_for_hold
+                from utils.global_db import get_global_db
+                _dbm = get_global_db()
+                _strength = lambda _c: strength_label(_dbm, _c)
+                _msg = build_message(
+                    _all_stocks, _stock_strategies, _stock_prices,
+                    _strength, analyze_stock, generate_advice_for_hold)
 
-                        _prev_result = _srm.get_selection_history(
-                            filters={'end_date': _today_str}, page=1, limit=5000
-                        )
-                        _prev_stocks = {}
-                        for _r in (_prev_result.get('data') or []):
-                            _d = _r.get('selection_date', '')
-                            if _d and _d < _today_str:
-                                if _d not in _prev_stocks:
-                                    _prev_stocks[_d] = set()
-                                _prev_stocks[_d].add(_r.get('stock_code', ''))
-
-                        if _prev_stocks:
-                            _prev_date = max(_prev_stocks.keys())
-                            _prev_codes = _prev_stocks[_prev_date]
-                            _new_codes = _today_codes - _prev_codes
-                            _removed_codes = _prev_codes - _today_codes
-
-                            if _new_codes or _removed_codes:
-                                lines.append("━━━━━━━━━━━━━━━━━━━━")
-                                lines.append(f"📋 与 {_prev_date} 对比")
-                                lines.append("")
-                                if _new_codes:
-                                    _new_names = [f"{s['code']} {s['name']}" for s in all_stocks if s['code'] in _new_codes]
-                                    lines.append(f"  🟢 新增 ({len(_new_codes)}只):")
-                                    for _n in _new_names:
-                                        lines.append(f"    + {_n}")
-                                if _removed_codes:
-                                    lines.append(f"  🔴 去除 ({len(_removed_codes)}只):")
-                                    for _rc in _removed_codes:
-                                        lines.append(f"    - {_rc}")
-                                lines.append("")
-                    except Exception as _diff_err:
-                        print(f"  ⚠️ 对比历史选股失败: {_diff_err}")
-
-                # ─── 买入建议分析 ───
-                if all_stocks:
-                    try:
-                        from simple_analyzer import analyze_stock, format_analysis_message
-                        _analyses = []
-                        for _stock in all_stocks:
-                            _a = analyze_stock(_stock['code'], _stock['name'])
-                            if _a['score'] > 0:
-                                _analyses.append(_a)
-                        if _analyses:
-                            _analysis_msg = format_analysis_message(_analyses)
-                            if _analysis_msg:
-                                lines.append(_analysis_msg)
-                    except Exception as _a_err:
-                        print(f"  ⚠️ 买入建议分析失败: {_a_err}")
-
-                # ─── 每日大盘复盘 + 新闻 ───
-                try:
-                    import requests as _req
-
-                    # 1) 主要指数行情
-                    _index_codes = [
-                        ('sh000001', '上证指数'),
-                        ('sz399001', '深证成指'),
-                        ('sz399006', '创业板指'),
-                        ('sh000688', '科创50'),
-                    ]
-                    _idx_lines = []
-                    for _code, _name in _index_codes:
+                # 推送发送（飞书 + 钉钉，各一条，与 web_server 共用同一套模板）
+                _feishu_enabled = quant.config.get('feishu', {}).get('enabled', True)
+                if _total > 0:
+                    if not _feishu_enabled:
+                        print("飞书推送已关闭（enabled=false），跳过")
+                    else:
                         try:
-                            _url = f"https://qt.gtimg.cn/q={_code}"
-                            _resp = _req.get(_url, timeout=5, headers={'User-Agent': 'Mozilla/5.0'})
-                            _data = _resp.text.split('~')
-                            if len(_data) > 45:
-                                _price = _data[3]
-                                _pct = _data[32]
-                                _vol = _data[37]
-                                try:
-                                    _vol_yi = float(_vol) / 10000
-                                    _vol_str = f"{_vol_yi:.0f}亿"
-                                except Exception:
-                                    _vol_str = ''
-                                _emoji = '🔴' if float(_pct) > 0 else '🟢' if float(_pct) < 0 else '⚪'
-                                _idx_lines.append(f"  {_emoji} {_name}: {_price} ({_pct}%) {_vol_str}")
-                        except Exception:
-                            pass
-                    if _idx_lines:
-                        lines.append("━━━━━━━━━━━━━━━━━━━━")
-                        lines.append(f"📈 今日大盘复盘 ({datetime.now().strftime('%Y-%m-%d %H:%M:%S')})")
-                        lines.append("")
-                        lines.extend(_idx_lines)
-                        lines.append("")
-
-                    # 2) 板块涨跌热力图
+                            if notifier.send_text(_msg):
+                                print("飞书推送完成")
+                            else:
+                                print("飞书推送未完成（webhook 无效或推送失败）")
+                        except Exception as _fe:
+                            print(f"飞书推送失败: {_fe}")
                     try:
-                        import re as _re, json as _json
-                        from sector_data import format_sector_message as _sector_msg
-                        _sector_text = _sector_msg()
-                        if _sector_text:
-                            lines.append("━━━━━━━━━━━━━━━━━━━━")
-                            lines.append(_sector_text)
-                    except Exception:
-                        pass
-
-                    # 3) 财经要闻
-                    try:
-                        _news_resp = _req.get(
-                            'https://feed.mix.sina.com.cn/api/roll/get?pageid=153&lid=2516&k=&num=12&page=1',
-                            timeout=8,
-                            headers={'User-Agent': 'Mozilla/5.0', 'Referer': 'https://finance.sina.com.cn'}
-                        )
-                        _news_list = _news_resp.json().get('result', {}).get('data', [])
-                        if _news_list:
-                            lines.append("━━━━━━━━━━━━━━━━━━━━")
-                            lines.append("📰 今日财经要闻")
-                            lines.append("")
-                            for _n in _news_list[:8]:
-                                _title = _n.get('title', '')[:50]
-                                _intro = _n.get('intro', '')
-                                if _title:
-                                    lines.append(f"  • {_title}")
-                                    if _intro:
-                                        lines.append(f"    {_intro}")
-                            lines.append("")
-                    except Exception:
-                        pass
-
-                except Exception as _idx_err:
-                    print(f"  ⚠️ 获取大盘数据失败: {_idx_err}")
-
-                lines.insert(1, f"共 {total} 只股票入选")
-                notifier.send_text("\n".join(lines))
+                        from utils.dingtalk_notifier import DingTalkNotifier
+                        _ding_cfg = quant.config.get('dingtalk', {})
+                        if not _ding_cfg.get('enabled', True):
+                            print("钉钉推送已关闭（enabled=false），跳过")
+                        else:
+                            _ding = DingTalkNotifier(
+                                _ding_cfg.get('webhook_url', ''),
+                                _ding_cfg.get('secret', ''),
+                            )
+                            if _ding.send_text(_msg):
+                                print("钉钉推送完成")
+                            else:
+                                print("钉钉推送未完成（webhook 未配置或失败）")
+                    except Exception as _de:
+                        print(f"钉钉推送失败: {_de}")
+                else:
+                    print("选股结果为空，跳过推送")
     
     elif args.command == 'web':
         # 启动Web服务器

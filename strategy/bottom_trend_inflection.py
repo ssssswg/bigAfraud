@@ -66,17 +66,13 @@ class BottomTrendInflectionStrategy(BaseStrategy):
         # 转换为正序（从旧到新）用于计算指标
         result = result.sort_values('date', ascending=True).reset_index(drop=True)
         
-        # 计算MACD指标
-        # DIF = 12日EMA - 26日EMA
-        ema_12 = result['close'].ewm(span=12, adjust=False).mean()
-        ema_26 = result['close'].ewm(span=26, adjust=False).mean()
-        result['DIF'] = ema_12 - ema_26
-        
-        # DEA = DIF的9日EMA
-        result['DEA'] = result['DIF'].ewm(span=9, adjust=False).mean()
-        
-        # MACD = DIF - DEA
-        result['MACD'] = result['DIF'] - result['DEA']
+        # 计算MACD指标（官方优先）
+        # DIF = 12日EMA - 26日EMA，DEA = DIF的9日EMA，MACD = DIF - DEA（1×）
+        from utils import technical as _tech
+        _macd = _tech.MACD(result, 12, 26, 9)
+        result['DIF'] = _macd['macd']
+        result['DEA'] = _macd['macd_signal']
+        result['MACD'] = _macd['macd'] - _macd['macd_signal']
         
         # 计算成交量均线
         volume_ma_period = self.params['volume_ma_period']

@@ -72,9 +72,10 @@ class ResistanceBreakoutStrategy(BaseStrategy):
         ma_short_period = self.params['ma_short_period']
         ma_mid_period = self.params['ma_mid_period']
         ma_long_period = self.params['ma_long_period']
-        result['ma_short'] = result['close'].rolling(window=ma_short_period).mean()
-        result['ma_mid'] = result['close'].rolling(window=ma_mid_period).mean()
-        result['ma_long'] = result['close'].rolling(window=ma_long_period).mean()
+        from utils import technical as _tech
+        result['ma_short'] = _tech.ma_norm(result, ma_short_period)
+        result['ma_mid'] = _tech.ma_norm(result, ma_mid_period)
+        result['ma_long'] = _tech.ma_norm(result, ma_long_period)
 
         # 始终返回正序数据
         return result

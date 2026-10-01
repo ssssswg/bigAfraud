@@ -103,7 +103,7 @@ export function updateProgressUI(status) {
             alert(message);
             progressCard.style.display = 'none';
             // 刷新统计信息
-            import('./stocks.js').then(module => module.loadStats());
+            import('./stocks.js?v=3').then(module => module.loadStats());
         }, 1000);
     }
 }
@@ -152,7 +152,7 @@ export async function checkUpdateStatusBackup(progressCard) {
                         alert(`Data update completed!\nSuccess: ${status.success}\nFailed: ${status.failed}`);
                         progressCard.style.display = 'none';
                         // 刷新统计信息
-                        import('./stocks.js').then(module => module.loadStats());
+                        import('./stocks.js?v=3').then(module => module.loadStats());
                     }, 1000);
                 }
             }

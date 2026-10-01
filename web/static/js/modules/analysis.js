@@ -138,6 +138,8 @@ export async function queryStockScore() {
             // 成功：渲染评分结果
             renderScoreResult(result.data);
             showElement('score-result-container');
+            // 追加：强弱共振分析（走弱标志 / 走强标志）
+            loadStrengthSignals(stockCode);
             // 滚动到结果区域
             const container = document.getElementById('score-result-container');
             if (container) container.scrollIntoView({ behavior: 'smooth' });
@@ -432,6 +434,112 @@ export function renderScoreHistoryTable(records) {
         `;
         tbody.appendChild(tr);
     });
+}
+
+/**
+ * 加载并渲染强弱共振分析（走弱标志 + 走强标志，并行拉取两个路由）
+ * @param {string} code - 股票代码
+ */
+export async function loadStrengthSignals(code) {
+    try {
+        const [wRes, sRes] = await Promise.all([
+            fetch(`/api/weak-signal?stock_code=${code}`),
+            fetch(`/api/strong-signal?stock_code=${code}`),
+        ]);
+        const w = await wRes.json();
+        const s = await sRes.json();
+        renderStrengthSignals(w, s);
+        showElement('score-strength-card');
+    } catch (e) {
+        console.error('强弱分析失败:', e);
+    }
+}
+
+/**
+ * 渲染强弱共振分析结果
+ * @param {Object} w - 走弱信号 /api/weak-signal 返回
+ * @param {Object} s - 走强信号 /api/strong-signal 返回
+ */
+export function renderStrengthSignals(w, s) {
+    // 走弱
+    const wLevel = w.level || 'none';
+    setText('weak-level', weakLevelText(wLevel));
+    setWeakColor('weak-level', wLevel);
+    setText('weak-score', w.weak_score != null ? w.weak_score : '--');
+    setText('weak-trend-bear', w.trend_bear ? '趋势转空' : '趋势未破');
+    setText('weak-falsify', w.falsify ? '假走弱（已收回关键均线，走弱信号失效）' : '真走弱（走弱信号未被推翻）');
+    setText('weak-signals', (w.signals || []).join('；') || '无');
+
+    // 走强
+    const sLevel = s.level || 'none';
+    setText('strong-level', strongLevelText(sLevel));
+    setStrongColor('strong-level', sLevel);
+    setText('strong-score', s.strong_score != null ? s.strong_score : '--');
+    setText('strong-trend-up', s.trend_up ? '趋势转多' : '趋势未破');
+    setText('strong-confirm', s.confirm ? '真走强（回踩不破MA20，强势可信）' : '假走强（未通过回踩检验，勿盲目追高）');
+    setText('strong-signals', (s.signals || []).join('；') || '无');
+
+    // ---- 互斥判定：走强 / 走弱 二选一 ----
+    // 按等级权重比较：弱 none=0 warning=1 confirmed=2 trend_weak=3；强 none=0 appear=1 confirmed=2 trend_up=3
+    // 等级高者胜；相等时再看趋势方向（趋势转空>走弱，趋势转多>走强）；否则为中性（无明确方向）
+    const wk = { none: 0, warning: 1, confirmed: 2, trend_weak: 3 };
+    const sk = { none: 0, appear: 1, confirmed: 2, trend_up: 3 };
+    const wRank = wk[wLevel] != null ? wk[wLevel] : 0;
+    const sRank = sk[sLevel] != null ? sk[sLevel] : 0;
+    let verdict = 'neutral';
+    if (wRank > sRank) verdict = 'weak';
+    else if (sRank > wRank) verdict = 'strong';
+    else if (w.trend_bear && !s.trend_up) verdict = 'weak';
+    else if (s.trend_up && !w.trend_bear) verdict = 'strong';
+
+    // 显隐：只展示占优一方，另一方隐藏；两者均无明确信号 → 显示中性提示
+    const cw = document.getElementById('card-weak-signal');
+    const cs = document.getElementById('card-strong-signal');
+    const neutral = document.getElementById('strength-neutral');
+    const grid = document.getElementById('strength-grid');
+    [cw, cs, neutral].forEach(el => { if (el) { el.style.display = 'none'; } });
+    if (grid) grid.style.gridTemplateColumns = '1fr 1fr';
+    if (verdict === 'weak') {
+        if (cw) { cw.style.display = 'block'; cw.style.gridColumn = '1/-1'; }
+        if (cs) cs.style.gridColumn = '';
+        if (neutral) neutral.style.gridColumn = '1/-1';
+    } else if (verdict === 'strong') {
+        if (cs) { cs.style.display = 'block'; cs.style.gridColumn = '1/-1'; }
+        if (cw) cw.style.gridColumn = '';
+        if (neutral) neutral.style.gridColumn = '1/-1';
+    } else {
+        if (neutral) { neutral.style.display = 'block'; neutral.style.gridColumn = '1/-1'; }
+        if (cw) cw.style.gridColumn = '';
+        if (cs) cs.style.gridColumn = '';
+    }
+}
+
+/** 走弱等级中文 */
+export function weakLevelText(level) {
+    const map = { none: '无', warning: '预警', confirmed: '确认走弱', trend_weak: '趋势性走弱' };
+    return map[level] || level || '--';
+}
+
+/** 走强等级中文 */
+export function strongLevelText(level) {
+    const map = { none: '无', appear: '迹象', confirmed: '确认走强', trend_up: '趋势确立' };
+    return map[level] || level || '--';
+}
+
+/** 走弱等级颜色 */
+export function setWeakColor(id, level) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const map = { warning: '#f59e0b', confirmed: '#ef4444', trend_weak: '#9C27B0', none: '#6b7280' };
+    el.style.color = map[level] || '#333';
+}
+
+/** 走强等级颜色 */
+export function setStrongColor(id, level) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    const map = { appear: '#f59e0b', confirmed: '#16a34a', trend_up: '#0ea5e9', none: '#6b7280' };
+    el.style.color = map[level] || '#333';
 }
 
 /** 隐藏所有评分状态卡片和结果容器 */

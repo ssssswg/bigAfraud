@@ -15,11 +15,22 @@ function _signalCardHtml(signal, strategiesStr, keyDate, reasons) {
     const s = signal.signals && Array.isArray(signal.signals) && signal.signals[0] ? signal.signals[0] : {};
     const _reasons = s.reasons && Array.isArray(s.reasons) ? s.reasons.map(r => '<span class="tag">' + r + '</span>').join('') : '';
     const _keyDate = s.key_date ? '<span class="tag">' + s.key_date_type + ': ' + s.key_date + '</span>' : '';
+    // 持有决策（新选中/继续持有/切换/舍弃/卖出）展示
+    let _holdHtml = '';
+    if (signal.hold_action) {
+        const _act = {new:'🆕 新选中', switch:'🔄 切换持有', hold:'🟢 继续持有', discard:'🗑️ 舍弃', sold:'🔴 触发卖出', empty:'⏳ 空仓'}[signal.hold_action] || signal.hold_action;
+        const _hz = signal.horizon ? ({short:'短线', mid:'中线', long:'长线'}[signal.horizon] || signal.horizon) : '';
+        const _why = signal.hold_reason ? '<div style="font-size:12px;color:#6b7280;margin-top:4px;">' + signal.hold_reason + '</div>' : '';
+        _holdHtml = '<div class="signal-hold" style="margin-top:4px;">' +
+            '<span class="tag" style="background:#fef3c7;color:#92400e;">' + _act + '</span>' +
+            (_hz ? '<span class="tag">' + _hz + '</span>' : '') + _why +
+        '</div>';
+    }
     return '<div class="signal-card">' +
         '<div class="signal-header">' +
             '<span class="signal-title"><a href="javascript:void(0)" onclick="viewStockDetail(\'' + signal.code + '\')" class="stock-link">' + signal.code + ' ' + signal.name + '</a></span>' +
             '<div class="signal-tags"><span class="tag">' + strategiesStr + '</span>' + _keyDate + _reasons + '</div>' +
-        '</div>' +
+        '</div>' + _holdHtml +
     '</div>';
 }
 

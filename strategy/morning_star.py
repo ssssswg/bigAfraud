@@ -63,8 +63,9 @@ class MorningStarStrategy(BaseStrategy):
         # 计算成交量比例
         result['volume_ratio'] = result['volume'] / result['volume'].shift(1)
 
-        # 计算5日均线
-        result['ma5'] = result['close'].rolling(window=5).mean()
+        # 计算5日均线（官方优先，顺序无关）
+        from utils import technical as _tech
+        result['ma5'] = _tech.ma_norm(result, 5)
 
         # 填充缺失值
         # 注意：此策略使用正序数据（index=0是最早日期）

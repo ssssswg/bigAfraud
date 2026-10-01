@@ -286,17 +286,24 @@ class BacktestDAO:
                 )
                 params_list.append(params)
             
-            conn = self.db.connect()
-            cursor = conn.cursor()
-            
+            self.db.begin_bulk_write()
+            conn = None
             try:
+                conn = self.db.connect()
+                cursor = conn.cursor()
                 cursor.executemany(sql, params_list)
                 conn.commit()
                 return True
             except Exception as e:
-                conn.rollback()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 logger.error(f"批量保存收益曲线失败: {str(e)}")
                 return False
+            finally:
+                self.db.end_bulk_write()
             
         except Exception as e:
             logger.error(f"保存收益曲线失败: {str(e)}")
@@ -382,8 +389,11 @@ class BacktestDAO:
                 sql += " WHERE "
                 conditions = []
                 if strategy_name:
-                    conditions.append("strategy_name = ?")
-                    params.append(strategy_name)
+                    from utils.selection_record_manager import strategy_filter_candidates
+                    cands = strategy_filter_candidates(strategy_name)
+                    conditions.append("(" + " OR ".join(["strategy_name LIKE ?"] * len(cands)) + ")")
+                    for c in cands:
+                        params.append('%' + c + '%')
                 if created_date:
                     conditions.append("DATE(created_at) = ?")
                     params.append(created_date)
@@ -807,17 +817,24 @@ class BacktestDAO:
                 )
                 params_list.append(params)
             
-            conn = self.db.connect()
-            cursor = conn.cursor()
-            
+            self.db.begin_bulk_write()
+            conn = None
             try:
+                conn = self.db.connect()
+                cursor = conn.cursor()
                 cursor.executemany(sql, params_list)
                 conn.commit()
                 return len(params_list)
             except Exception as e:
-                conn.rollback()
+                if conn is not None:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
                 logger.error(f"批量保存交易记录失败: {str(e)}")
                 return 0
+            finally:
+                self.db.end_bulk_write()
             
         except Exception as e:
             logger.error(f"批量保存交易记录失败: {str(e)}")

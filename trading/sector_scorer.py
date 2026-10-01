@@ -169,21 +169,9 @@ class SectorScorer:
             return ""
 
     def _get_pro(self):
-        """
-        获取 Tushare pro API 实例（延迟初始化）
-
-        返回:
-            tushare pro API 对象
-        """
+        """获取 Tushare pro API 实例（延迟初始化；统一走 utils.tushare_client.get_pro，镜像+全局限流）"""
         if self._pro is None:
-            try:
-                import tushare as ts
-                # 使用 token 初始化 pro API
-                self._pro = get_pro(self._token)
-                logger.debug("Tushare pro API 初始化成功")
-            except Exception as e:
-                logger.error(f"Tushare pro API 初始化失败: {e}")
-                raise
+            self._pro = get_pro(self._token)
         return self._pro
 
     def _format_date(self, date_str: str) -> str:
@@ -489,6 +477,35 @@ class SectorScorer:
             logger.error(f"获取板块资金流向失败: {trade_date}, {e}")
             return None
 
+    def _fetch_sector_moneyflow_ind(
+        self, trade_date: str
+    ) -> Optional[pd.DataFrame]:
+        """
+        获取指定交易日行业资金流向数据（moneyflow_ind_ths，doc343）
+
+        参数:
+            trade_date: 交易日期（YYYYMMDD 格式）
+        返回:
+            DataFrame: 行业资金流向数据，失败返回 None
+        """
+        cache_key = f"sector_moneyflow_ind_{trade_date}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached
+        try:
+            pro = self._get_pro()
+            df = self._call_tushare_with_retry(
+                pro.moneyflow_ind_ths,
+                trade_date=trade_date,
+            )
+            if df is not None and not df.empty:
+                self._cache.set(cache_key, df)
+                return df
+            return None
+        except Exception as e:
+            logger.error(f"获取行业资金流向失败: {trade_date}, {e}")
+            return None
+
     # ============================================================
     # 评分计算方法
     # ============================================================
@@ -514,14 +531,15 @@ class SectorScorer:
 
         for trade_date in dates:
             # 获取当日所有板块行情
-            df = self._fetch_sector_daily(trade_date)
+            # ths_daily 无涨跌幅列，改用概念板块资金流(moneyflow_cnt_ths, doc371)的 pct_change 做涨幅排名
+            df = self._fetch_sector_moneyflow(trade_date)
             if df is None or df.empty:
                 # 当日无数据，跳过
                 logger.debug(f"板块行情无数据: {trade_date}")
                 continue
 
-            # 确保 pct_chg 字段存在（涨跌幅，也兼容 pct_change）
-            pct_col = "pct_chg" if "pct_chg" in df.columns else "pct_change"
+            # 板块涨跌幅字段（moneyflow_cnt_ths 提供 pct_change）
+            pct_col = "pct_change" if "pct_change" in df.columns else "pct_chg"
             if pct_col not in df.columns:
                 logger.warning(f"板块行情缺少涨跌幅字段: {trade_date}")
                 continue
@@ -603,6 +621,18 @@ class SectorScorer:
                     sector_rows = df[df[name_col] == sector_name]
 
             if sector_rows.empty:
+                # 概念板块匹配不到时，回退匹配行业资金流（moneyflow_ind_ths doc343）
+                _ind = self._fetch_sector_moneyflow_ind(trade_date)
+                if _ind is not None and not _ind.empty:
+                    _ic = "ts_code" if "ts_code" in _ind.columns else "code"
+                    _ir = _ind[_ind[_ic] == sector_code]
+                    if _ir.empty and sector_name:
+                        _inc = "industry" if "industry" in _ind.columns else ("name" if "name" in _ind.columns else None)
+                        if _inc:
+                            _ir = _ind[_ind[_inc] == sector_name]
+                    if not _ir.empty:
+                        sector_rows = _ir
+            if sector_rows.empty:
                 # 该板块当日无资金流向数据
                 logger.debug(f"板块 {sector_name or sector_code} 在 {trade_date} 无资金流向数据")
                 continue
@@ -665,6 +695,32 @@ class SectorScorer:
     # 公开接口方法
     # ============================================================
 
+    def _get_stock_sw_industry(self, stock_code: str) -> Optional[str]:
+        """
+        通过申万行业分类（index_member_all doc335）获取个股申万二级行业名，
+        用于与同花顺行业资金流（moneyflow_ind_ths doc343）按行业名匹配。
+        申万二级行业名（如 汽车零部件/电力/软件开发）与同花顺行业命名相近，匹配率高。
+        """
+        cache_key = f"sw_industry_{stock_code}"
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            return cached or None
+        result = None
+        try:
+            pro = self._get_pro()
+            ts_code = self._convert_ts_code(stock_code)
+            df = self._call_tushare_with_retry(
+                pro.index_member_all, ts_code=ts_code, is_new='Y'
+            )
+            if df is not None and not df.empty:
+                l2 = df.iloc[0].get('l2_name')
+                if l2:
+                    result = str(l2)
+        except Exception:
+            result = None
+        self._cache.set(cache_key, result)
+        return result
+
     def calculate_score(
         self, stock_code: str, score_date: str
     ) -> Tuple[float, SectorDetail]:
@@ -709,6 +765,10 @@ class SectorScorer:
 
         # 获取个股所属板块列表
         sectors = self._get_stock_sectors(stock_code)
+        # 用申万二级行业(doc335)补充为行业板块，以匹配行业资金流(moneyflow_ind_ths doc343)
+        sw_ind = self._get_stock_sw_industry(stock_code)
+        if sw_ind:
+            sectors = list(sectors) + [{'ts_code': 'SW', 'name': sw_ind}]
         if not sectors:
             # 无板块映射，返回 0 分
             logger.warning(f"个股无板块映射: {stock_code}")

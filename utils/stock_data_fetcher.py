@@ -326,8 +326,14 @@ class StockDataFetcher:
             '600349', '603302', '603361', '688688',
         }
 
+        # 退市/暂停上市股黑名单（Tushare list_status D/P），如 600321 正源股份等已摘牌标的。
+        # 顺序理清：在获取股票清单【之前】先确保黑名单是最新的（缺失/过期自动从 Tushare 刷新），
+        # 再用最新黑名单过滤清单，避免用空集/过期集过滤造成退市股漏入（空跑）。
+        from utils.delisted_stocks import load_delisted_stocks
+        delisted_codes = load_delisted_stocks(max_age_days=1)
+
         def _filter_invalid(stock_dict):
-            return {k: v for k, v in stock_dict.items() if k not in invalid_codes}
+            return {k: v for k, v in stock_dict.items() if k not in invalid_codes and k not in delisted_codes}
 
         # 方法1: 优先使用 Tushare 获取完整股票列表
         for attempt in range(max_retries):

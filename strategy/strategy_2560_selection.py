@@ -69,8 +69,9 @@ class Strategy2560Selection(BaseStrategy):
         
         ma10_period = self.params['ma10_period']
         
-        result['ma10'] = result['close'].rolling(window=ma10_period, min_periods=1).mean()
-        result['ma25'] = result['close'].rolling(window=ma_period, min_periods=1).mean()
+        from utils import technical as _tech
+        result['ma10'] = _tech.ma_norm(result, ma10_period)
+        result['ma25'] = _tech.ma_norm(result, ma_period)
         result['vol_ma5'] = result['volume'].rolling(window=vol_ma_short, min_periods=1).mean()
         result['vol_ma60'] = result['volume'].rolling(window=vol_ma_long, min_periods=1).mean()
 

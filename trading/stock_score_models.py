@@ -69,6 +69,12 @@ class TechnicalDetail:
         self.veto: bool = False
         # 一票否决原因说明
         self.veto_reason: str = ""
+        # 命中的负面技术指标（破位/离5日线10%/超布林上轨10%/放量滞涨/放量大跌）
+        self.negative_signals: List[str] = []
+        # stk_factor_pro 技术因子健康度信号（MACD多头/RSI适中/站上MA20等）
+        self.factor_signals: List[str] = []
+        # stk_factor_pro 技术因子健康度分（并入技术面得分）
+        self.factor_score: float = 0.0
 
     def to_dict(self) -> dict:
         """
@@ -84,6 +90,12 @@ class TechnicalDetail:
             "veto": self.veto,
             # 否决原因
             "veto_reason": self.veto_reason,
+            # 负面技术指标
+            "negative_signals": self.negative_signals,
+            # 技术因子健康度信号
+            "factor_signals": self.factor_signals,
+            # 技术因子健康度分
+            "factor_score": self.factor_score,
         }
 
     @staticmethod
@@ -103,6 +115,11 @@ class TechnicalDetail:
         detail.veto = data.get("veto", False)
         # 解析否决原因
         detail.veto_reason = data.get("veto_reason", "")
+        # 解析负面技术指标
+        detail.negative_signals = data.get("negative_signals", [])
+        # 解析技术因子健康度
+        detail.factor_signals = data.get("factor_signals", [])
+        detail.factor_score = data.get("factor_score", 0.0)
         return detail
 
 

@@ -145,9 +145,15 @@ class RankingManager:
             return []
     
     def _get_existing_ranking(self, selection_date: str) -> List[Dict]:
-        """获取已有的排名结果"""
+        """获取已有的排名结果
+
+        卖点持久化在 stock_selection_record 的 sell_status/sell_price/sell_reason/sell_yield：
+        - 已卖出的记录（sell_status='卖出'）直接采用库中固化的卖点，不再重新生成/重算
+        - 持有/无卖点的记录实时计算；若新触发卖出，写库固化，之后不再重算
+        """
         existing_sql = """
-            SELECT id, stock_code, stock_name, industry, sector, selection_price, score, rank_position
+            SELECT id, stock_code, stock_name, industry, sector, selection_price, score, rank_position,
+                   sell_status, sell_price, sell_reason, sell_yield
             FROM stock_selection_record 
             WHERE selection_date = ? AND is_active = 1 
             AND strategy_name NOT LIKE '%M头%' 
@@ -156,12 +162,41 @@ class RankingManager:
             ORDER BY rank_position ASC
         """
         existing_records = self.db_manager.query(existing_sql, (selection_date,))
-        
+
         results = []
+        to_freeze = []  # 新触发卖出需写库固化的记录
         for record in existing_records:
+            # 已卖出的票：直接采用库中固化的卖点，不再重新生成
+            if record.get('sell_status') == '卖出':
+                results.append({
+                    'id': record['id'],
+                    'stock_code': record['stock_code'],
+                    'stock_name': record['stock_name'],
+                    'industry': record['industry'],
+                    'sector': record['sector'],
+                    'selection_price': record['selection_price'],
+                    'score': record['score'],
+                    'rank_position': record['rank_position'],
+                    'sell_price': record['sell_price'],
+                    'sell_reason': record['sell_reason'] or '',
+                    'sell_yield': record['sell_yield'],
+                    'sell_status': '卖出',
+                })
+                continue
+
+            # 持有/无卖点：实时计算
             sell = self._compute_sell_advice(
                 record['stock_code'], record['selection_price'], selection_date
             )
+            sell_status = sell['sell_status'] if sell else '持有'
+            sell_price = sell['sell_price'] if sell else None
+            sell_reason = sell['sell_reason'] if sell else ''
+            sell_yield = sell['sell_yield'] if sell else None
+
+            # 新触发卖出：写库固化，后续不再重算
+            if sell and sell_status == '卖出':
+                to_freeze.append((sell_status, sell_price, sell_reason, sell_yield, record['id']))
+
             results.append({
                 'id': record['id'],
                 'stock_code': record['stock_code'],
@@ -171,11 +206,21 @@ class RankingManager:
                 'selection_price': record['selection_price'],
                 'score': record['score'],
                 'rank_position': record['rank_position'],
-                'sell_price': sell['sell_price'] if sell else None,
-                'sell_reason': sell['sell_reason'] if sell else '',
-                'sell_yield': sell['sell_yield'] if sell else 0,
-                'sell_status': sell['sell_status'] if sell else '持有',
+                'sell_price': sell_price,
+                'sell_reason': sell_reason,
+                'sell_yield': sell_yield,
+                'sell_status': sell_status,
             })
+
+        # 固化新触发卖出的记录（写库，保证后续重新生成不再重算）
+        if to_freeze:
+            try:
+                freeze_sql = "UPDATE stock_selection_record SET sell_status=?, sell_price=?, sell_reason=?, sell_yield=? WHERE id=?"
+                for row in to_freeze:
+                    self.db_manager.execute_with_retry(freeze_sql, row)
+            except Exception as e:
+                logger.warning(f"固化卖出记录失败: {e}")
+
         return results
     
     def _batch_get_strategy_counts(self, stock_codes: List[str], selection_date: str) -> Dict[str, int]:
@@ -206,6 +251,8 @@ class RankingManager:
         
         conn = None
         try:
+            # 独占写窗口：选股排名批量写与K线更新/财务入库等其它写错峰，避免 SQLite 库级锁互撞
+            self.db_manager.begin_bulk_write()
             conn = self.db_manager.connect()
             cursor = conn.cursor()
             
@@ -252,6 +299,7 @@ class RankingManager:
             if conn:
                 conn.rollback()
         finally:
+            self.db_manager.end_bulk_write()
             if conn:
                 conn.close()
     
@@ -343,108 +391,9 @@ class RankingManager:
             return ''
     
     def _compute_sell_advice(self, stock_code: str, selection_price: float, selection_date: str) -> Optional[Dict]:
-        """逆人性卖出信号：从选股日到最新交易日逐日扫描，返回卖点/原因/收益
-
-        卖出价口径：盘后确认信号 → 次日开盘价卖出（可执行）；信号在最新交易日触发时先给出卖出建议，具体收益率待次日收盘后回填。
-
-        逆人性逻辑（与散户相反）：
-          - 散户破位死扛 → 我们跌破MA5(该强不强)/MA10 即止损卖出
-          - 散户放量滞涨舍不得卖 → 量>1.5倍5日均量且滞涨 即卖出(出货)
-          - 散户高位贪婪追涨 → 偏离月线>10% / 触布林上轨 即止盈卖出(兑现)
-          - 强者恒强豁免：强势创新高(MA5>MA10多头且逼近近10日高点)时不因位置高卖出
-          - 健康上涨豁免：量价齐升(涨幅>0且放量) + 温和放量(量>5日均量且≤3倍) + MACD无顶背离 → 放量滞涨/高位止盈不触发，继续持有（跌破均线的破位信号除外）
-        """
-        try:
-            import pandas as pd
-            df = self.db_manager.read_stock(stock_code)
-            if df is None or df.empty or not selection_price:
-                return None
-            if 'date' not in df.columns:
-                df = df.reset_index()
-            df['date'] = pd.to_datetime(df['date'])
-            df = df.sort_values('date').reset_index(drop=True)
-            rows = df.to_dict('records')
-            closes = [float(r['close']) for r in rows]
-            opens = [float(r['open']) for r in rows]
-            highs = [float(r['high']) for r in rows]
-            vols = [float(r.get('volume') or 0) for r in rows]
-            # MACD 预计算（12/26/9），用于顶背离判定
-            _s = pd.Series(closes)
-            _ema_fast = _s.ewm(span=12, adjust=False).mean()
-            _ema_slow = _s.ewm(span=26, adjust=False).mean()
-            dif_arr = (_ema_fast - _ema_slow).tolist()
-            dea_arr = (_ema_fast - _ema_slow).ewm(span=9, adjust=False).mean().tolist()
-            sd = pd.to_datetime(selection_date)
-            # 选股日之后起始索引
-            start = None
-            for k, r in enumerate(rows):
-                if r['date'] > sd:
-                    start = k
-                    break
-            if start is None or start + 9 >= len(rows):
-                # K线不足10根，退化为当前价持有
-                last = closes[-1]
-                return {'sell_price': round(last, 2), 'sell_reason': '数据不足，持有',
-                        'sell_yield': round((last - selection_price) / selection_price * 100, 2),
-                        'sell_status': '持有'}
-            last_high_price = -float('inf')
-            last_high_dif = -float('inf')
-            for i in range(start, len(rows)):
-                ma5 = sum(closes[i-4:i+1]) / 5 if i >= 4 else None
-                ma10 = sum(closes[i-9:i+1]) / 10 if i >= 9 else None
-                ma20 = sum(closes[i-19:i+1]) / 20 if i >= 19 else None
-                std20 = None
-                if i >= 19:
-                    w = closes[i-19:i+1]
-                    m = sum(w) / len(w)
-                    std20 = (sum((x - m) ** 2 for x in w) / len(w)) ** 0.5
-                prev = closes[i-1]
-                pct = (closes[i] - prev) / prev * 100 if prev else 0
-                vol5 = sum(vols[max(0, i-5):i]) / min(5, i) if i >= 5 else None
-                vol_expand = bool(vol5) and vols[i] > vol5 * 1.5
-                near_high = max(highs[max(0, i-9):i+1])
-                strong = ma5 and ma10 and ma5 > ma10 and closes[i] >= near_high * 0.98
-                # 健康上涨（继续持有）：量价齐升 + 温和放量 + MACD无顶背离
-                price_up = pct > 0
-                vol_up = (i > 0) and vols[i] > vols[i-1]
-                moderate_vol = bool(vol5) and vols[i] > vol5 and vols[i] <= vol5 * 3.0
-                top_div = False
-                if closes[i] > last_high_price:
-                    if dif_arr[i] < last_high_dif - 1e-9:
-                        top_div = True
-                    last_high_price = closes[i]
-                    last_high_dif = dif_arr[i]
-                healthy = price_up and vol_up and moderate_vol and (not top_div)
-                # 信号判定
-                reason = None
-                if ma10 and closes[i] < ma5 and closes[i] < ma10:
-                    reason = '跌破5/10日线(该强不强)'
-                elif ma5 and closes[i] < ma5:
-                    reason = '跌破5日线(该强不强)'
-                elif vol_expand and pct < 2 and not healthy:
-                    reason = '放量滞涨(出货信号)'
-                elif ma20 and (closes[i] > ma20 * 1.10 or (std20 and closes[i] > ma20 + 2 * std20)) and not strong and not healthy:
-                    reason = '高位止盈(偏离月线>10%)'
-                if reason:
-                    # 盘后确认信号 → 次日开盘价卖出（可执行口径）
-                    if i + 1 < len(rows):
-                        sell = opens[i + 1]
-                        return {'sell_price': round(sell, 2), 'sell_reason': reason,
-                                'sell_yield': round((sell - selection_price) / selection_price * 100, 2),
-                                'sell_status': '卖出'}
-                    # 信号在最新交易日触发：卖出建议提前给出，收益率待次日收盘后回填
-                    return {'sell_price': None,
-                            'sell_reason': f'{reason}（次日开盘卖出，收益待收盘后计算）',
-                            'sell_yield': None,
-                            'sell_status': '卖出'}
-            # 未触发 → 持有
-            last = closes[-1]
-            return {'sell_price': round(last, 2), 'sell_reason': '持有中',
-                    'sell_yield': round((last - selection_price) / selection_price * 100, 2),
-                    'sell_status': '持有'}
-        except Exception as e:
-            logger.warning(f"计算卖出建议失败 {stock_code}: {e}")
-            return None
+        """逆人性卖出信号（转发到独立函数 compute_sell_signal，供选股持有决策历史回扫复用）"""
+        from utils.sell_signal import compute_sell_signal
+        return compute_sell_signal(self.db_manager, stock_code, selection_price, selection_date)
 
     def track_ranking(self, selection_date: str, top_n: int = 5, sort_by: str = 'yield') -> List[Dict]:
         """跟踪指定日期的排名
@@ -700,15 +649,14 @@ class RankingManager:
             # 0. 清除旧的评分数据（强制重新计算时）
             if force_recalculate:
                 try:
-                    # 清除 stock_score 表中该日期的数据
-                    delete_score_sql = "DELETE FROM stock_score WHERE score_date = ?"
-                    self.db_manager.execute_with_retry(delete_score_sql, (selection_date,))
-                    logger.info(f"已清除 {selection_date} 的旧评分数据")
-                    
-                    # 清除 stock_score_detail 表中该日期的数据
+                    # 先删子表 detail（外键引用 score），再删父表 score，避免 FOREIGN KEY 约束失败
                     delete_detail_sql = "DELETE FROM stock_score_detail WHERE score_date = ?"
                     self.db_manager.execute_with_retry(delete_detail_sql, (selection_date,))
                     logger.info(f"已清除 {selection_date} 的旧评分详情数据")
+
+                    delete_score_sql = "DELETE FROM stock_score WHERE score_date = ?"
+                    self.db_manager.execute_with_retry(delete_score_sql, (selection_date,))
+                    logger.info(f"已清除 {selection_date} 的旧评分数据")
                     
                     # 提交删除操作
                     conn = self.db_manager.connect()

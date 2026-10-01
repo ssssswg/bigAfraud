@@ -66,7 +66,7 @@ class WBottomStrategy(BaseStrategy):
         :param df: 股票数据DataFrame（倒序，最新在index=0）
         :return: 添加了指标列的DataFrame
         """
-        from utils.technical import MA, KDJ, calculate_zhixing_trend
+        from utils.technical import ma_norm, KDJ, calculate_zhixing_trend
 
         # 检查输入数据是否为空
         if df is None or df.empty:
@@ -81,8 +81,8 @@ class WBottomStrategy(BaseStrategy):
         # 2. 计算短期均线和长期均线
         short_period = self.params['short_ma_period']
         long_period = self.params['long_ma_period']
-        result['short_ma'] = MA(result['close'], short_period)
-        result['long_ma'] = MA(result['close'], long_period)
+        result['short_ma'] = ma_norm(result, short_period)
+        result['long_ma'] = ma_norm(result, long_period)
 
         # 3. 计算KDJ指标（K、D、J）
         kdj_df = KDJ(result, n=9, m1=3, m2=3)
@@ -90,15 +90,10 @@ class WBottomStrategy(BaseStrategy):
         result['D'] = kdj_df['D']
         result['J'] = kdj_df['J']
 
-        # 4. 计算知行趋势线（短期趋势线和多空线）
-        # 优化：直接计算，减少函数调用开销
-        from utils.technical import EMA
-        # 知行短期趋势线 = EMA(EMA(CLOSE,10),10)
-        result['short_term_trend'] = EMA(EMA(result['close'], 10), 10)
-        # 知行多空线 = (MA(m1) + MA(m2) + MA(m3) + MA(m4)) / 4
-        m1, m2, m3, m4 = 14, 28, 57, 114
-        result['bull_bear_line'] = (MA(result['close'], m1) + MA(result['close'], m2) + 
-                                   MA(result['close'], m3) + MA(result['close'], m4)) / 4
+        # 4. 计算知行趋势线（短期趋势线和多空线，官方优先，顺序无关）
+        _zh = calculate_zhixing_trend(result)
+        result['short_term_trend'] = _zh['short_term_trend']
+        result['bull_bear_line'] = _zh['bull_bear_line']
 
         # 5. 计算成交量均线（排除当日，shift(1)后再rolling）
         vol_period = self.params['volume_ma_period']

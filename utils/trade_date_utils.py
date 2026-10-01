@@ -61,8 +61,7 @@ def _is_trading_day_impl(date_str: str) -> bool:
                 import json
                 with open(config_path, 'r', encoding='utf-8') as f:
                     tushare_config = json.load(f)
-                if 'api_key' in tushare_config:
-                    ts.set_token(tushare_config['api_key'])
+
             pro = get_pro()
             df = pro.trade_cal(
                 start_date=date_str_fmt,
@@ -137,8 +136,7 @@ def get_trading_days(start_date: str, end_date: str) -> List[str]:
             if config_path.exists():
                 with open(config_path, 'r', encoding='utf-8') as f:
                     tushare_config = json.load(f)
-                if 'api_key' in tushare_config:
-                    ts.set_token(tushare_config['api_key'])
+
 
             pro = get_pro()
 

@@ -103,24 +103,24 @@ class MultiPartyCannonStrategy(BaseStrategy):
         
         # 只在需要时计算MACD和KDJ
         if self.params['enable_macd_filter'] or self.params['enable_kdj_filter']:
-            # 计算MACD（数据已是正序）
-            ema_12 = result['close'].ewm(span=12, adjust=False).mean()
-            ema_26 = result['close'].ewm(span=26, adjust=False).mean()
-            result['DIF'] = ema_12 - ema_26
-            result['DEA'] = result['DIF'].ewm(span=9, adjust=False).mean()
-            result['MACD'] = result['DIF'] - result['DEA']
-            
-            # 计算KDJ指标
-            from utils.technical import KDJ
-            kdj_df = KDJ(result, n=9, m1=3, m2=3)
+            # 计算MACD（官方优先，数据已是正序）
+            from utils import technical as _tech
+            _macd = _tech.MACD(result, 12, 26, 9)
+            result['DIF'] = _macd['macd']
+            result['DEA'] = _macd['macd_signal']
+            result['MACD'] = _macd['macd'] - _macd['macd_signal']  # 原语义：dif-dea（1×）
+
+            # 计算KDJ指标（官方优先）
+            kdj_df = _tech.KDJ(result, n=9, m1=3, m2=3)
             result['K'] = kdj_df['K']
             result['D'] = kdj_df['D']
             result['J'] = kdj_df['J']
-        
+
         # 只在需要时计算均线
         if self.params['enable_ma_filter']:
             ma_period = self.params['ma_period']
-            result[f'MA{ma_period}'] = result['close'].rolling(window=ma_period).mean()
+            from utils import technical as _tech
+            result[f'MA{ma_period}'] = _tech.ma_norm(result, ma_period)
             
             # 计算趋势线
             from utils.technical import calculate_zhixing_trend

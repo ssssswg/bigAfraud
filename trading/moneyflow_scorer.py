@@ -164,21 +164,9 @@ class MoneyflowScorer:
             return ""
 
     def _get_pro(self):
-        """
-        获取 Tushare pro API 实例（延迟初始化）
-
-        返回:
-            tushare pro API 对象
-        """
+        """获取 Tushare pro API 实例（延迟初始化；统一走 utils.tushare_client.get_pro，镜像+全局限流）"""
         if self._pro is None:
-            try:
-                import tushare as ts
-                # 使用 token 初始化 pro API
-                self._pro = get_pro(self._token)
-                logger.debug("Tushare pro API 初始化成功")
-            except Exception as e:
-                logger.error(f"Tushare pro API 初始化失败: {e}")
-                raise
+            self._pro = get_pro(self._token)
         return self._pro
 
     def _format_date(self, date_str: str) -> str:
@@ -535,9 +523,10 @@ class MoneyflowScorer:
         返回:
             float: 主力净流入维度得分
         """
-        # 一票否决条件：净额 < -10000万元
+        # 严重资金净流出（净额 < -10000万元）：大扣分，不否决（资金面不作为一票否决）
+        # 严重净流出（净额 < -10000万元）：小扣分（最多10分），资金面不否决
         if net_flow_5d < VETO_MAIN_NET_FLOW_THRESHOLD:
-            return VETO_SCORE
+            return -10
         # 净额 > 10000万元：100分
         if net_flow_5d > 10000:
             return 100
@@ -553,8 +542,8 @@ class MoneyflowScorer:
         # 净额 == 0（数据缺失或持平）：30分（中性）
         if net_flow_5d == 0:
             return 30
-        # 净额 < 0：-20分
-        return -20
+        # 净额 < 0：小扣分
+        return -5
 
     def _score_large_ratio(self, daily_ratios: List[float]) -> float:
         """
@@ -728,9 +717,9 @@ class MoneyflowScorer:
         # 大单流入 + 小单也流入 = 共同看多
         if large_net > 0 and small_net >= 0:
             return 60
-        # 大单流出 + 小单流入 = 出货信号（一票否决）
+        # 大单流出 + 小单流入 = 出货信号：大扣分，不否决（资金面不作为一票否决）
         if large_net < 0 and small_net > 0:
-            return VETO_SCORE
+            return -60
         # 其他情况（大单流出 + 小单也流出等）
         return 0
 
@@ -905,27 +894,11 @@ class MoneyflowScorer:
         # 保存主力净流入数据
         detail.main_net_flow = metrics["net_flow_5d"]
 
-        # 先检查一票否决条件（使用已提取的指标，避免重复获取数据）
-        is_veto, veto_reason = self.check_veto(stock_code, formatted_date, metrics)
-        if is_veto:
-            # 触发一票否决
-            detail.veto = True
-            detail.veto_reason = veto_reason
-            logger.warning(f"股票 {stock_code} 资金面一票否决: {veto_reason}")
-            return VETO_SCORE, detail
-
         # 1. 计算主力净流入得分
         net_flow_5d = metrics["net_flow_5d"]
         detail.main_net_flow = net_flow_5d
         main_score = self._score_main_net_flow(net_flow_5d)
         detail.main_net_flow_score = main_score
-
-        # 检查主力净流入一票否决
-        if main_score == VETO_SCORE:
-            detail.veto = True
-            detail.veto_reason = f"5日主力净额 {net_flow_5d:.0f} 万元 < -10000万元"
-            logger.warning(f"股票 {stock_code} 主力净流入一票否决")
-            return VETO_SCORE, detail
 
         # 2. 计算大单占比得分
         daily_ratios = metrics["daily_ratios"]
@@ -937,18 +910,28 @@ class MoneyflowScorer:
         detail.north_fund_score = north_score
         detail.north_fund_status = north_status
 
-        # 4. 计算主力散户方向得分
+        # 4. 出货信号五维评分（量能+资金+技术，逆人性派发判断）→ 方向得分
+        #    分级：<30 正常/洗盘 | 30-60 警惕 | 60-85 高度警惕 | ≥85 确认出货
         large_net = metrics["large_net"]
         small_net = metrics["small_net"]
-        direction_score = self._score_direction(large_net, small_net)
+        try:
+            from utils.distribution import compute_distribution_score
+            dist = compute_distribution_score(self.db, stock_code, score_date, moneyflow_df=df)
+            _d = dist['score']
+            if _d >= 85:
+                direction_score = -100.0
+            elif _d >= 60:
+                direction_score = -60.0
+            elif _d >= 30:
+                direction_score = -30.0
+            else:
+                direction_score = 0.0
+            detail.direction_note = dist['level']
+        except Exception as e:
+            logger.warning(f"出货评分计算失败，回退原方向判断: {e}")
+            direction_score = self._score_direction(large_net, small_net)
+            detail.direction_note = '回退'
         detail.direction_score = direction_score
-
-        # 检查方向一票否决（出货信号）
-        if direction_score == VETO_SCORE:
-            detail.veto = True
-            detail.veto_reason = "出货信号：大单净流出且小单净流入"
-            logger.warning(f"股票 {stock_code} 出货信号一票否决")
-            return VETO_SCORE, detail
 
         # 计算综合得分（加权求和）
         total_score = (

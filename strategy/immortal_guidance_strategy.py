@@ -79,12 +79,12 @@ class ImmortalGuidanceStrategy(BaseStrategy):
         if all(col in result.columns for col in ['ma5', 'ma10', 'ma20', 'volume_ma5']):
             return result
 
-        close_series = result['close'].iloc[::-1]
         volume_series = result['volume'].iloc[::-1]
 
         ma_periods = self.params['ma_periods']
+        from utils import technical as _tech
         for period in ma_periods:
-            result[f'ma{period}'] = close_series.rolling(window=period, min_periods=1).mean().iloc[::-1].values
+            result[f'ma{period}'] = _tech.ma_norm(result, period)
 
         result['volume_ma5'] = volume_series.shift(1).rolling(window=5, min_periods=1).mean().iloc[::-1].values
 

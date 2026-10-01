@@ -41,26 +41,20 @@ class GoldenCrossNotGreenStrategy(BaseStrategy):
         macd_slow = self.params.get('macd_slow', 26)
         macd_signal = self.params.get('macd_signal', 9)
 
-        ema_short = result['close'].ewm(span=macd_fast, adjust=False).mean()
-        ema_long = result['close'].ewm(span=macd_slow, adjust=False).mean()
-        dif = ema_short - ema_long
-        dea = dif.ewm(span=macd_signal, adjust=False).mean()
-        macd_hist = dif - dea
+        # 计算MACD指标（官方优先）
+        from utils import technical as _tech
+        _macd = _tech.MACD(result, macd_fast, macd_slow, macd_signal)
+        result['dif'] = _macd['macd']
+        result['dea'] = _macd['macd_signal']
+        result['macd'] = _macd['macd'] - _macd['macd_signal']  # 原语义：dif-dea（1×）
 
-        result['dif'] = dif
-        result['dea'] = dea
-        result['macd'] = macd_hist
-
-        # 计算布林带指标
+        # 计算布林带指标（官方优先）
         bollinger_period = self.params.get('bollinger_period', 20)
         bollinger_std = self.params.get('bollinger_std', 2)
-
-        # 布林带中轨（20日移动平均线）
-        result['boll_mid'] = result['close'].rolling(window=bollinger_period).mean()
-        # 布林带上轨和下轨
-        boll_std = result['close'].rolling(window=bollinger_period).std()
-        result['boll_upper'] = result['boll_mid'] + boll_std * bollinger_std
-        result['boll_lower'] = result['boll_mid'] - boll_std * bollinger_std
+        _boll = _tech.Bollinger(result, bollinger_period, bollinger_std)
+        result['boll_mid'] = _boll['bb_mid']
+        result['boll_upper'] = _boll['bb_upper']
+        result['boll_lower'] = _boll['bb_lower']
         # 布林带宽度（上轨 - 下轨）
         result['boll_width'] = result['boll_upper'] - result['boll_lower']
 
