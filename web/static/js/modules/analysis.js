@@ -91,7 +91,7 @@ export function setupStockAnalysis() {
  * 查询个股图谱评分
  * 从表单获取股票代码和日期，调用评分API，渲染结果
  */
-export async function queryStockScore() {
+export async function queryStockScore(force = false) {
     // 获取表单输入值
     const stockCode = document.getElementById('score-stock-code').value.trim();
     const dateInput = document.getElementById('score-date-input').value;
@@ -119,11 +119,14 @@ export async function queryStockScore() {
     try {
         // 构建API请求URL
         let url = `/api/stock/score/${stockCode}`;
+        const qs = [];
+        if (force) qs.push('force=1');
         // 如果用户选择了日期，转换为 YYYYMMDD 格式
         if (dateInput) {
             const dateParam = dateInput.replace(/-/g, '');
-            url += `?date=${dateParam}`;
+            qs.push(`date=${dateParam}`);
         }
+        if (qs.length) url += '?' + qs.join('&');
 
         console.log('请求评分API:', url);
         const response = await fetch(url);
@@ -138,8 +141,8 @@ export async function queryStockScore() {
             // 成功：渲染评分结果
             renderScoreResult(result.data);
             showElement('score-result-container');
-            // 追加：强弱共振分析（走弱标志 / 走强标志）
-            loadStrengthSignals(stockCode);
+            // 追加：强弱共振分析（走弱标志 / 走强标志），与评分同一日期
+            loadStrengthSignals(stockCode, dateInput);
             // 滚动到结果区域
             const container = document.getElementById('score-result-container');
             if (container) container.scrollIntoView({ behavior: 'smooth' });
@@ -439,12 +442,14 @@ export function renderScoreHistoryTable(records) {
 /**
  * 加载并渲染强弱共振分析（走弱标志 + 走强标志，并行拉取两个路由）
  * @param {string} code - 股票代码
+ * @param {string} date - 评分所选日期（YYYY-MM-DD），空则用最新
  */
-export async function loadStrengthSignals(code) {
+export async function loadStrengthSignals(code, date = '') {
     try {
+        const dateQ = date ? `&date=${date.replace(/-/g, '')}` : '';
         const [wRes, sRes] = await Promise.all([
-            fetch(`/api/weak-signal?stock_code=${code}`),
-            fetch(`/api/strong-signal?stock_code=${code}`),
+            fetch(`/api/weak-signal?stock_code=${code}${dateQ}`),
+            fetch(`/api/strong-signal?stock_code=${code}${dateQ}`),
         ]);
         const w = await wRes.json();
         const s = await sRes.json();

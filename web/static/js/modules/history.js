@@ -92,7 +92,7 @@ export function renderHistoryTable(data) {
         row.innerHTML = `
             <td>${formatDate(record.selection_date)}</td>
             <td>${escapeHtml(record.stock_name)}</td>
-            <td><span style="background: #dbeafe; color: #0c4a6e; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600;">${escapeHtml(record.strategy_name)}</span></td>
+            <td>${(record.strategy_name || '--').split(/[+，,]/).map(s => s.trim()).filter(Boolean).map(s => `<span style="background:#dbeafe; color:#0c4a6e; padding:3px 8px; border-radius:4px; font-size:12px; font-weight:600; display:inline-block; margin:2px 3px;">${escapeHtml(s)}</span>`).join('')}</td>
             <td>¥${formatPrice(record.selection_price)}</td>
             <td>${scoreTxt}</td>
             <td>${record.strategy_count != null ? Number(record.strategy_count) : 1}</td>

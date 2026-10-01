@@ -87,11 +87,12 @@ def prefetch_official_factor_batch(pro=None, trade_date=None):
     except Exception:
         return 0
 
-def prefetch_official_factor_history(pro=None, codes=None):
+def prefetch_official_factor_history(pro=None, codes=None, end_date=None):
     """对候选股补拉 400 天官方历史（方案C：历史 100% 官方）。
 
     逐只 get_factor_history 拉 400 天官方因子填 _OFFICIAL_HISTORY，
     供后续 official_factor_scope 命中（历史官方优先于批量当日）。候选股少（≤30），补拉快。
+    end_date: 可选截止日期（YYYY-MM-DD 或 YYYYMMDD），供历史选股追溯；空则用最新。
     失败静默回退。返回命中数。
     """
     try:
@@ -101,8 +102,8 @@ def prefetch_official_factor_history(pro=None, codes=None):
             pro = factor_fetcher.get_pro()
         if pro is None or not codes:
             return 0
-        _end = datetime.now().strftime('%Y%m%d')
-        _start = (datetime.now() - timedelta(days=400)).strftime('%Y%m%d')
+        _end = (end_date or datetime.now().strftime('%Y%m%d')).replace('-', '')
+        _start = (datetime.strptime(_end, '%Y%m%d') - timedelta(days=400)).strftime('%Y%m%d')
         n = 0
         for c in codes:
             _ts = factor_fetcher.to_ts_code(str(c))

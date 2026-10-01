@@ -1454,8 +1454,8 @@ def run_selection():
                             _cands.append(_c)
                 _cands = list(dict.fromkeys(_cands))
                 if _cands:
-                    _n = _tech.prefetch_official_factor_history(codes=_cands)
-                    func_logger.info(f"候选股补拉400天官方历史完成，命中 {_n}/{len(_cands)} 只")
+                    _n = _tech.prefetch_official_factor_history(codes=_cands, end_date=end_date)
+                    func_logger.info(f"候选股补拉400天官方历史完成，命中 {_n}/{len(_cands)} 只（end_date={end_date}）")
             except Exception as _e:
                 func_logger.warning(f"候选股补拉官方历史失败: {_e}")
 
@@ -1764,10 +1764,13 @@ def run_selection():
             # ── 使用统一推送模板构建唯一消息（模板二：持仓操作）──
             from utils.push_templates import build_message
             from simple_analyzer import analyze_stock, generate_advice_for_hold
-            _strength = lambda _c: _strength_label(db_manager, _c)
+            # 强弱标志/评分/支撑止损均按选股所选日期计算（追溯历史选股，非始终取最新）
+            _strength = lambda _c: _strength_label(db_manager, _c, date=end_date)
+            _analyze = lambda _c, _n: analyze_stock(_c, _n, date=end_date)
+            _advice = lambda _c, _n, _d=None, _p=None: generate_advice_for_hold(_c, _n, _d, _p, date=end_date)
             _msg = build_message(
                 _all_stocks, _stock_strategies, _stock_prices,
-                _strength, analyze_stock, generate_advice_for_hold)
+                _strength, _analyze, _advice)
 
             # ============ 推送发送（飞书 + 钉钉，各一条）============
             _feishu_enabled = _cfg.get('feishu', {}).get('enabled', True)
@@ -2536,13 +2539,22 @@ def _mutual_strength(weak_dict, strong_dict):
     return 'none'
 
 
-def _strength_label(db, code):
-    """计算单只股票的强弱真伪标识（真走强/假走强/真走弱/假走弱/无），弱强互斥"""
+def _strength_label(db, code, date=None):
+    """计算单只股票的强弱真伪标识（真走强/假走强/真走弱/假走弱/无），弱强互斥
+    date: 可选，YYYY-MM-DD 或 YYYYMMDD，按该日期截取K线计算（选股按所选日期，非始终最新）"""
     try:
         from utils.weak_signal import compute_weak_signal
         from utils.strong_signal import compute_strong_signal
-        w = compute_weak_signal(db, code)
-        s = compute_strong_signal(db, code)
+        _df = None
+        if date:
+            try:
+                _df = db.read_stock(code, end_date=date)
+                if _df is None or _df.empty:
+                    _df = None
+            except Exception:
+                _df = None
+        w = compute_weak_signal(db, code, df=_df)
+        s = compute_strong_signal(db, code, df=_df)
         lv = _mutual_strength(w, s)
         if lv.startswith('weak:'):
             return '假走弱' if (w or {}).get('falsify') else '真走弱'
@@ -3017,8 +3029,18 @@ def get_weak_signal():
             lookback = 20
         from utils.weak_signal import compute_weak_signal
         from utils.global_db import get_global_db
-        w = compute_weak_signal(get_global_db(), code, lookback=lookback)
-        return jsonify({'success': True, 'code': code, 'lookback': lookback, **w})
+        # 可选按日期截取（个股图谱按所选日期分析，而非始终取最新）
+        date = (request.args.get('date') or request.args.get('end_date') or '').strip()
+        _df = None
+        if date:
+            try:
+                _df = get_global_db().read_stock(code, end_date=date)
+                if _df is None or _df.empty:
+                    _df = None
+            except Exception:
+                _df = None
+        w = compute_weak_signal(get_global_db(), code, df=_df, lookback=lookback)
+        return jsonify({'success': True, 'code': code, 'date': date or None, 'lookback': lookback, **w})
     except Exception as e:
         logger.error(f"弱转共振判定接口异常: {e}")
         return jsonify({'success': False, 'error': str(e)})
@@ -3052,8 +3074,18 @@ def get_strong_signal():
             lookback = 20
         from utils.strong_signal import compute_strong_signal
         from utils.global_db import get_global_db
-        s = compute_strong_signal(get_global_db(), code, lookback=lookback)
-        return jsonify({'success': True, 'code': code, 'lookback': lookback, **s})
+        # 可选按日期截取（个股图谱按所选日期分析，而非始终取最新）
+        date = (request.args.get('date') or request.args.get('end_date') or '').strip()
+        _df = None
+        if date:
+            try:
+                _df = get_global_db().read_stock(code, end_date=date)
+                if _df is None or _df.empty:
+                    _df = None
+            except Exception:
+                _df = None
+        s = compute_strong_signal(get_global_db(), code, df=_df, lookback=lookback)
+        return jsonify({'success': True, 'code': code, 'date': date or None, 'lookback': lookback, **s})
     except Exception as e:
         logger.error(f"走强共振判定接口异常: {e}")
         return jsonify({'success': False, 'error': str(e)})

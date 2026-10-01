@@ -284,16 +284,20 @@ def get_stock_score(code):
             score_date = _get_latest_score_date(code, dao)
             logger.info(f"使用最新评分日期: {score_date}")
         
-        # 先尝试从数据库获取已有评分
+        force = request.args.get('force', '') in ('1', 'true', 'True', 'yes', 'on')
         dao = _get_dao() if 'dao' not in locals() else dao
-        score = dao.get_score(code, score_date)
+        score = None
+        # 非强制模式：先尝试从数据库获取已有评分（缓存命中直接返回）
+        if not force:
+            score = dao.get_score(code, score_date)
+            # 检查缓存数据是否完整（维度详情可能缺失）
+            if score and not _is_score_complete(score):
+                logger.info(f"缓存数据不完整，重新计算: {code} {score_date}")
+                score = None
+        else:
+            logger.info(f"强制重新计算评分: {code} {score_date}")
 
-        # 检查缓存数据是否完整（维度详情可能缺失）
-        if score and not _is_score_complete(score):
-            logger.info(f"缓存数据不完整，重新计算: {code} {score_date}")
-            score = None
-
-        # 如果数据库中没有或不完整，则实时计算
+        # 如果数据库中没有/不完整/强制模式，则实时计算
         if not score:
             logger.info(f"实时计算评分: {code} {score_date}")
             calculator = _get_calculator()

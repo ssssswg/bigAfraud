@@ -66,12 +66,13 @@ def calculate_macd(klines):
     return dif, dea, macd
 
 
-def analyze_stock(code, name):
-    """分析单只股票，返回评分和建议（数据源：本地核心库K线）"""
+def analyze_stock(code, name, date=None):
+    """分析单只股票，返回评分和建议（数据源：本地核心库K线；date可选，按该日期截取K线，供历史选股追溯）"""
     try:
         from utils.global_db import get_global_db
         from utils.price_levels import load_df
-        _df = load_df(get_global_db(), code)
+        _db = get_global_db()
+        _df = load_df(_db, code) if not date else _db.read_stock(code, end_date=date, order='asc')
     except Exception:
         return {"code": code, "name": name, "score": 0, "advice": "数据不足", "reasons": []}
     if _df is None or len(_df) < 20:
@@ -189,8 +190,9 @@ def format_analysis_message(analyses):
     return "\n".join(lines)
 
 
-def generate_advice_for_hold(code, name, entry_date=None, entry_price=None):
+def generate_advice_for_hold(code, name, entry_date=None, entry_price=None, date=None):
     """对已推荐股票生成持仓操作建议：持有/减仓/卖出 + 止损/止盈价位
+    date: 可选，按该日期截取K线（供历史选股追溯），空则用最新
 
     优先复用统一卖出路由 compute_sell_signal（与选股持有决策/排名卖点同一套规则）：
     传入推荐日 entry_date（及推荐价 entry_price）后，若历史回扫触发卖出信号，
@@ -201,7 +203,7 @@ def generate_advice_for_hold(code, name, entry_date=None, entry_price=None):
         from utils.global_db import get_global_db
         from utils.price_levels import load_df
         _db = get_global_db()
-        _df = load_df(_db, code)
+        _df = load_df(_db, code) if not date else _db.read_stock(code, end_date=date, order='asc')
     except Exception:
         return None
     if _df is None or len(_df) < 25:
@@ -303,7 +305,7 @@ def generate_advice_for_hold(code, name, entry_date=None, entry_price=None):
     _rec = None
     try:
         from utils.price_levels import get_recommend
-        _rec = get_recommend(_db, code)
+        _rec = get_recommend(_db, code, date=date)
     except Exception:
         pass
     if _rec:

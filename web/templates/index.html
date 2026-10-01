@@ -1390,11 +1390,15 @@
                                         <input type="date" id="score-date-input" name="score-date"
                                                aria-label="选择评分日期">
                                     </div>
-                                    <div class="form-group">
+                                    <div style="display:flex; flex-direction:row; gap:8px; align-items:center; justify-content:flex-end;">
                                         <button type="submit" id="score-query-btn" class="btn btn-primary"
                                                 aria-label="股票评分">
                                             <span id="score-btn-text">开始分析</span>
                                             <span id="score-loading" class="loading-spinner" style="display:none;" aria-hidden="true">⏳</span>
+                                        </button>
+                                        <button type="button" id="score-reanalyze-btn" class="btn btn-warning"
+                                                onclick="queryStockScore(true)" aria-label="强制重新分析" title="忽略缓存，强制重新计算评分">
+                                            🔄 重新分析
                                         </button>
                                     </div>
                                 </div>
@@ -2069,7 +2073,7 @@
     </div>
 
     <script src="/static/js/dashboard_stats.js"></script>
-    <script type="module" src="/static/js/app.js?v=22"></script>
+    <script type="module" src="/static/js/app.js?v=23"></script>
     <script src="/static/js/lib/echarts.min.js?v=1"></script>
     <script src="/static/js/kline_chart.js?v=9"></script>
     <script src="/static/js/init_simple.js?v=2"></script>

@@ -37,15 +37,16 @@ PIVOT_WINDOW = 20
 
 # ==================== 数据加载 ====================
 
-def load_df(db, stock_code: str):
+def load_df(db, stock_code: str, end_date=None):
     """从本地核心库读取前复权K线，返回时间升序 DataFrame
 
     db: DBManager 实例（须含 read_stock）
     stock_code: 股票代码
+    end_date: 可选，按该日期截取K线（供历史选股追溯）；空则取全量最新
     返回: DataFrame（升序，含 date/open/high/low/close/volume）或 None
     """
     try:
-        df = db.read_stock(stock_code)
+        df = db.read_stock(stock_code, end_date=end_date) if end_date else db.read_stock(stock_code)
         if df is None or df.empty:
             return None
         if 'date' not in df.columns:
@@ -298,13 +299,15 @@ def _fmt_cluster(cl, role: str, close: float) -> Dict:
 
 def compute_support_resistance(db, stock_code: str,
                                tolerance: float = CLUSTER_TOLERANCE,
-                               with_chips: bool = True) -> Dict:
+                               with_chips: bool = True,
+                               end_date=None) -> Dict:
     """统一支撑/压力位 API（四层方法 + 共振 + 区间）
 
     db: DBManager 实例
     stock_code: 股票代码
     tolerance: 区间容差（默认 0.8%，可取 ±0.5%~1%）
     with_chips: 是否尝试拉取筹码分布（量能位），默认 True
+    end_date: 可选，按该日期截取K线（供历史选股追溯）；空则取全量最新
 
     返回:
         {
@@ -315,7 +318,7 @@ def compute_support_resistance(db, stock_code: str,
         }
     数据不足时返回 None。
     """
-    df = load_df(db, stock_code)
+    df = load_df(db, stock_code, end_date=end_date)
     if df is None or len(df) < 30:
         return None
 
@@ -389,8 +392,10 @@ def _pick_level(levels: List[Dict], close: float, confirmed_only: bool = True,
         return pool[0] if pool else None
 
 
-def recommend_prices(db, stock_code: str) -> Optional[Dict]:
+def recommend_prices(db, stock_code: str, date=None) -> Optional[Dict]:
     """结合趋势与统一支撑/压力位生成推荐价格（买入价/止损/止盈）与风险收益比
+
+    date: 可选，按该日期截取K线（供历史选股追溯）；空则取全量最新
 
     返回:
         {
@@ -402,7 +407,7 @@ def recommend_prices(db, stock_code: str) -> Optional[Dict]:
           'rrr','eligible','space_limited',
         }
     """
-    sr = compute_support_resistance(db, stock_code)
+    sr = compute_support_resistance(db, stock_code, end_date=date)
     if sr is None:
         return None
     close = sr['close']
@@ -469,6 +474,6 @@ def recommend_prices(db, stock_code: str) -> Optional[Dict]:
     }
 
 
-def get_recommend(db, stock_code: str) -> Optional[Dict]:
+def get_recommend(db, stock_code: str, date=None) -> Optional[Dict]:
     """便捷入口：读本地K线并返回推荐价格（供 simple_analyzer / 推送链路复用）"""
-    return recommend_prices(db, stock_code)
+    return recommend_prices(db, stock_code, date=date)
